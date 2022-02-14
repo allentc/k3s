@@ -3,8 +3,10 @@ package deps
 import (
 	"crypto"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	b64 "encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -25,7 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	apiserverconfigv1 "k8s.io/apiserver/pkg/apis/config/v1"
-	"k8s.io/kubernetes/pkg/controlplane"
 )
 
 const (
@@ -90,6 +91,68 @@ func KubeConfig(dest, url, caCert, clientCert, clientKey string) error {
 	return kubeconfigTemplate.Execute(output, &data)
 }
 
+// CreateRuntimeCertFiles is responsible for filling out all the
+// .crt and .key filenames for a ControlRuntime.
+func CreateRuntimeCertFiles(config *config.Control, runtime *config.ControlRuntime) {
+	runtime.ClientCA = filepath.Join(config.DataDir, "tls", "client-ca.crt")
+	runtime.ClientCAKey = filepath.Join(config.DataDir, "tls", "client-ca.key")
+	runtime.ServerCA = filepath.Join(config.DataDir, "tls", "server-ca.crt")
+	runtime.ServerCAKey = filepath.Join(config.DataDir, "tls", "server-ca.key")
+	runtime.RequestHeaderCA = filepath.Join(config.DataDir, "tls", "request-header-ca.crt")
+	runtime.RequestHeaderCAKey = filepath.Join(config.DataDir, "tls", "request-header-ca.key")
+	runtime.IPSECKey = filepath.Join(config.DataDir, "cred", "ipsec.psk")
+
+	runtime.ServiceKey = filepath.Join(config.DataDir, "tls", "service.key")
+	runtime.PasswdFile = filepath.Join(config.DataDir, "cred", "passwd")
+	runtime.NodePasswdFile = filepath.Join(config.DataDir, "cred", "node-passwd")
+
+	runtime.KubeConfigAdmin = filepath.Join(config.DataDir, "cred", "admin.kubeconfig")
+	runtime.KubeConfigController = filepath.Join(config.DataDir, "cred", "controller.kubeconfig")
+	runtime.KubeConfigScheduler = filepath.Join(config.DataDir, "cred", "scheduler.kubeconfig")
+	runtime.KubeConfigAPIServer = filepath.Join(config.DataDir, "cred", "api-server.kubeconfig")
+	runtime.KubeConfigCloudController = filepath.Join(config.DataDir, "cred", "cloud-controller.kubeconfig")
+
+	runtime.ClientAdminCert = filepath.Join(config.DataDir, "tls", "client-admin.crt")
+	runtime.ClientAdminKey = filepath.Join(config.DataDir, "tls", "client-admin.key")
+	runtime.ClientControllerCert = filepath.Join(config.DataDir, "tls", "client-controller.crt")
+	runtime.ClientControllerKey = filepath.Join(config.DataDir, "tls", "client-controller.key")
+	runtime.ClientCloudControllerCert = filepath.Join(config.DataDir, "tls", "client-"+version.Program+"-cloud-controller.crt")
+	runtime.ClientCloudControllerKey = filepath.Join(config.DataDir, "tls", "client-"+version.Program+"-cloud-controller.key")
+	runtime.ClientSchedulerCert = filepath.Join(config.DataDir, "tls", "client-scheduler.crt")
+	runtime.ClientSchedulerKey = filepath.Join(config.DataDir, "tls", "client-scheduler.key")
+	runtime.ClientKubeAPICert = filepath.Join(config.DataDir, "tls", "client-kube-apiserver.crt")
+	runtime.ClientKubeAPIKey = filepath.Join(config.DataDir, "tls", "client-kube-apiserver.key")
+	runtime.ClientKubeProxyCert = filepath.Join(config.DataDir, "tls", "client-kube-proxy.crt")
+	runtime.ClientKubeProxyKey = filepath.Join(config.DataDir, "tls", "client-kube-proxy.key")
+	runtime.ClientK3sControllerCert = filepath.Join(config.DataDir, "tls", "client-"+version.Program+"-controller.crt")
+	runtime.ClientK3sControllerKey = filepath.Join(config.DataDir, "tls", "client-"+version.Program+"-controller.key")
+
+	runtime.ServingKubeAPICert = filepath.Join(config.DataDir, "tls", "serving-kube-apiserver.crt")
+	runtime.ServingKubeAPIKey = filepath.Join(config.DataDir, "tls", "serving-kube-apiserver.key")
+
+	runtime.ClientKubeletKey = filepath.Join(config.DataDir, "tls", "client-kubelet.key")
+	runtime.ServingKubeletKey = filepath.Join(config.DataDir, "tls", "serving-kubelet.key")
+
+	runtime.ClientAuthProxyCert = filepath.Join(config.DataDir, "tls", "client-auth-proxy.crt")
+	runtime.ClientAuthProxyKey = filepath.Join(config.DataDir, "tls", "client-auth-proxy.key")
+
+	runtime.ETCDServerCA = filepath.Join(config.DataDir, "tls", "etcd", "server-ca.crt")
+	runtime.ETCDServerCAKey = filepath.Join(config.DataDir, "tls", "etcd", "server-ca.key")
+	runtime.ETCDPeerCA = filepath.Join(config.DataDir, "tls", "etcd", "peer-ca.crt")
+	runtime.ETCDPeerCAKey = filepath.Join(config.DataDir, "tls", "etcd", "peer-ca.key")
+	runtime.ServerETCDCert = filepath.Join(config.DataDir, "tls", "etcd", "server-client.crt")
+	runtime.ServerETCDKey = filepath.Join(config.DataDir, "tls", "etcd", "server-client.key")
+	runtime.PeerServerClientETCDCert = filepath.Join(config.DataDir, "tls", "etcd", "peer-server-client.crt")
+	runtime.PeerServerClientETCDKey = filepath.Join(config.DataDir, "tls", "etcd", "peer-server-client.key")
+	runtime.ClientETCDCert = filepath.Join(config.DataDir, "tls", "etcd", "client.crt")
+	runtime.ClientETCDKey = filepath.Join(config.DataDir, "tls", "etcd", "client.key")
+
+	if config.EncryptSecrets {
+		runtime.EncryptionConfig = filepath.Join(config.DataDir, "cred", "encryption-config.json")
+		runtime.EncryptionHash = filepath.Join(config.DataDir, "cred", "encryption-state.json")
+	}
+}
+
 // GenServerDeps is responsible for generating the cluster dependencies
 // needed to successfully bootstrap a cluster.
 func GenServerDeps(config *config.Control, runtime *config.ControlRuntime) error {
@@ -109,7 +172,7 @@ func GenServerDeps(config *config.Control, runtime *config.ControlRuntime) error
 		return err
 	}
 
-	if err := genEncryptionConfig(config, runtime); err != nil {
+	if err := genEncryptionConfigAndState(config, runtime); err != nil {
 		return err
 	}
 
@@ -186,11 +249,7 @@ func genEncryptedNetworkInfo(controlConfig *config.Control, runtime *config.Cont
 	}
 
 	controlConfig.IPSECPSK = psk
-	if err := ioutil.WriteFile(runtime.IPSECKey, []byte(psk+"\n"), 0600); err != nil {
-		return err
-	}
-
-	return nil
+	return ioutil.WriteFile(runtime.IPSECKey, []byte(psk+"\n"), 0600)
 }
 
 func getServerPass(passwd *passwd.Passwd, config *config.Control) (string, error) {
@@ -294,7 +353,7 @@ func genClientCerts(config *config.Control, runtime *config.ControlRuntime) erro
 		return err
 	}
 
-	certGen, err = factory("cloud-controller-manager", nil, runtime.ClientCloudControllerCert, runtime.ClientCloudControllerKey)
+	certGen, err = factory(version.Program+"-cloud-controller-manager", nil, runtime.ClientCloudControllerCert, runtime.ClientCloudControllerKey)
 	if err != nil {
 		return err
 	}
@@ -313,14 +372,8 @@ func genServerCerts(config *config.Control, runtime *config.ControlRuntime) erro
 		return err
 	}
 
-	_, apiServerServiceIP, err := controlplane.ServiceIPRange(*config.ServiceIPRange)
-	if err != nil {
-		return err
-	}
-
 	altNames := &certutil.AltNames{
-		DNSNames: []string{"localhost", "kubernetes", "kubernetes.default", "kubernetes.default.svc." + config.ClusterDomain},
-		IPs:      []net.IP{apiServerServiceIP},
+		DNSNames: []string{"kubernetes", "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc." + config.ClusterDomain},
 	}
 
 	addSANs(altNames, config.SANs)
@@ -345,9 +398,7 @@ func genETCDCerts(config *config.Control, runtime *config.ControlRuntime) error 
 		return err
 	}
 
-	altNames := &certutil.AltNames{
-		DNSNames: []string{"localhost"},
-	}
+	altNames := &certutil.AltNames{}
 	addSANs(altNames, config.SANs)
 
 	if _, err := createClientCertKey(regen, "etcd-server", nil,
@@ -601,7 +652,7 @@ func expired(certFile string, pool *x509.CertPool) bool {
 	return certutil.IsCertExpired(certificates[0], config.CertificateRenewDays)
 }
 
-func genEncryptionConfig(controlConfig *config.Control, runtime *config.ControlRuntime) error {
+func genEncryptionConfigAndState(controlConfig *config.Control, runtime *config.ControlRuntime) error {
 	if !controlConfig.EncryptSecrets {
 		return nil
 	}
@@ -642,9 +693,14 @@ func genEncryptionConfig(controlConfig *config.Control, runtime *config.ControlR
 			},
 		},
 	}
-	jsonfile, err := json.Marshal(encConfig)
+	b, err := json.Marshal(encConfig)
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(runtime.EncryptionConfig, jsonfile, 0600)
+	if err := ioutil.WriteFile(runtime.EncryptionConfig, b, 0600); err != nil {
+		return err
+	}
+	encryptionConfigHash := sha256.Sum256(b)
+	ann := "start-" + hex.EncodeToString(encryptionConfigHash[:])
+	return ioutil.WriteFile(controlConfig.Runtime.EncryptionHash, []byte(ann), 0600)
 }

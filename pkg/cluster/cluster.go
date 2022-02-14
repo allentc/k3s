@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"net/url"
+	"runtime"
 	"strings"
 
 	"github.com/k3s-io/kine/pkg/endpoint"
@@ -19,11 +20,11 @@ type Cluster struct {
 	config           *config.Control
 	runtime          *config.ControlRuntime
 	managedDB        managed.Driver
-	shouldBootstrap  bool
-	storageStarted   bool
-	etcdConfig       endpoint.ETCDConfig
+	EtcdConfig       endpoint.ETCDConfig
 	joining          bool
+	storageStarted   bool
 	saveBootstrap    bool
+	shouldBootstrap  bool
 }
 
 // Start creates the dynamic tls listener, http request handler,
@@ -78,22 +79,15 @@ func (c *Cluster) Start(ctx context.Context) (<-chan struct{}, error) {
 		return nil, err
 	}
 
-	// if necessary, store bootstrap data to datastore
-	if c.saveBootstrap {
-		if err := c.save(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	// if necessary, record successful bootstrap
-	if c.shouldBootstrap {
-		if err := c.bootstrapped(); err != nil {
-			return nil, err
-		}
-	}
-
 	if err := c.startStorage(ctx); err != nil {
 		return nil, err
+	}
+
+	// if necessary, store bootstrap data to datastore
+	if c.saveBootstrap {
+		if err := Save(ctx, c.config, c.EtcdConfig, false); err != nil {
+			return nil, err
+		}
 	}
 
 	// at this point, if etcd is in use, it's bootstrapping is complete
@@ -102,14 +96,23 @@ func (c *Cluster) Start(ctx context.Context) (<-chan struct{}, error) {
 	// snapshots will be empty.
 	if c.managedDB != nil {
 		go func() {
-			for range ready {
-				if err := c.save(ctx); err != nil {
-					panic(err)
-				}
-			}
+			for {
+				select {
+				case <-ready:
+					if err := Save(ctx, c.config, c.EtcdConfig, false); err != nil {
+						panic(err)
+					}
 
-			if err := c.managedDB.StoreSnapshotData(ctx); err != nil {
-				logrus.Errorf("Failed to record snapshots for cluster: %v", err)
+					if !c.config.EtcdDisableSnapshots {
+						if err := c.managedDB.ReconcileSnapshotData(ctx); err != nil {
+							logrus.Errorf("Failed to record snapshots for cluster: %v", err)
+						}
+					}
+
+					return
+				default:
+					runtime.Gosched()
+				}
 			}
 		}()
 	}
@@ -136,14 +139,14 @@ func (c *Cluster) startStorage(ctx context.Context) error {
 	// Persist the returned etcd configuration. We decide if we're doing leader election for embedded controllers
 	// based on what the kine wrapper tells us about the datastore. Single-node datastores like sqlite don't require
 	// leader election, while basically all others (etcd, external database, etc) do since they allow multiple servers.
-	c.etcdConfig = etcdConfig
-	c.config.Datastore.Config = etcdConfig.TLSConfig
+	c.EtcdConfig = etcdConfig
+	c.config.Datastore.BackendTLSConfig = etcdConfig.TLSConfig
 	c.config.Datastore.Endpoint = strings.Join(etcdConfig.Endpoints, ",")
 	c.config.NoLeaderElect = !etcdConfig.LeaderElect
 	return nil
 }
 
-// New creates an initial cluster using the provided configuration
+// New creates an initial cluster using the provided configuration.
 func New(config *config.Control) *Cluster {
 	return &Cluster{
 		config:  config,

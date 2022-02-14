@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,6 +35,8 @@ func main() {
 	}
 
 	etcdsnapshotCommand := internalCLIAction(version.Program+"-"+cmds.EtcdSnapshotCommand, dataDir, os.Args)
+	secretsencryptCommand := internalCLIAction(version.Program+"-"+cmds.SecretsEncryptCommand, dataDir, os.Args)
+	certCommand := internalCLIAction(version.Program+"-"+cmds.CertCommand, dataDir, os.Args)
 
 	// Handle subcommand invocation (k3s server, k3s crictl, etc)
 	app := cmds.NewApp()
@@ -51,9 +54,22 @@ func main() {
 				etcdsnapshotCommand,
 				etcdsnapshotCommand),
 		),
+		cmds.NewSecretsEncryptCommand(secretsencryptCommand,
+			cmds.NewSecretsEncryptSubcommands(
+				secretsencryptCommand,
+				secretsencryptCommand,
+				secretsencryptCommand,
+				secretsencryptCommand,
+				secretsencryptCommand,
+				secretsencryptCommand),
+		),
+		cmds.NewCertCommand(
+			cmds.NewCertSubcommands(
+				certCommand),
+		),
 	}
 
-	if err := app.Run(os.Args); err != nil {
+	if err := app.Run(os.Args); err != nil && !errors.Is(err, context.Canceled) {
 		logrus.Fatal(err)
 	}
 }
@@ -90,7 +106,7 @@ func runCLIs(dataDir string) bool {
 	progName := filepath.Base(os.Args[0])
 	switch progName {
 	case "crictl", "ctr", "kubectl":
-		if err := externalCLI(progName, dataDir, os.Args[1:]); err != nil {
+		if err := externalCLI(progName, dataDir, os.Args[1:]); err != nil && !errors.Is(err, context.Canceled) {
 			logrus.Fatal(err)
 		}
 		return true
@@ -166,13 +182,13 @@ func getAssetAndDir(dataDir string) (string, string) {
 func extract(dataDir string) (string, error) {
 	// first look for global asset folder so we don't create a HOME version if not needed
 	_, dir := getAssetAndDir(datadir.DefaultDataDir)
-	if _, err := os.Stat(filepath.Join(dir, "bin", "containerd")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, "bin", "k3s")); err == nil {
 		return dir, nil
 	}
 
 	asset, dir := getAssetAndDir(dataDir)
 	// check if target content already exists
-	if _, err := os.Stat(filepath.Join(dir, "bin", "containerd")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, "bin", "k3s")); err == nil {
 		return dir, nil
 	}
 

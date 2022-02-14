@@ -1,7 +1,6 @@
 package etcdsnapshot
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +14,7 @@ import (
 	"github.com/rancher/k3s/pkg/daemons/config"
 	"github.com/rancher/k3s/pkg/etcd"
 	"github.com/rancher/k3s/pkg/server"
+	util2 "github.com/rancher/k3s/pkg/util"
 	"github.com/rancher/wrangler/pkg/signals"
 	"github.com/urfave/cli"
 )
@@ -39,6 +39,7 @@ func commandSetup(app *cli.Context, cfg *cmds.Server, sc *server.Config) (string
 	sc.ControlConfig.DataDir = cfg.DataDir
 	sc.ControlConfig.EtcdSnapshotName = cfg.EtcdSnapshotName
 	sc.ControlConfig.EtcdSnapshotDir = cfg.EtcdSnapshotDir
+	sc.ControlConfig.EtcdSnapshotCompress = cfg.EtcdSnapshotCompress
 	sc.ControlConfig.EtcdS3 = cfg.EtcdS3
 	sc.ControlConfig.EtcdS3Endpoint = cfg.EtcdS3Endpoint
 	sc.ControlConfig.EtcdS3EndpointCA = cfg.EtcdS3EndpointCA
@@ -48,6 +49,8 @@ func commandSetup(app *cli.Context, cfg *cmds.Server, sc *server.Config) (string
 	sc.ControlConfig.EtcdS3BucketName = cfg.EtcdS3BucketName
 	sc.ControlConfig.EtcdS3Region = cfg.EtcdS3Region
 	sc.ControlConfig.EtcdS3Folder = cfg.EtcdS3Folder
+	sc.ControlConfig.EtcdS3Insecure = cfg.EtcdS3Insecure
+	sc.ControlConfig.EtcdS3Timeout = cfg.EtcdS3Timeout
 	sc.ControlConfig.Runtime = &config.ControlRuntime{}
 
 	return server.ResolveDataDir(cfg.DataDir)
@@ -69,7 +72,7 @@ func run(app *cli.Context, cfg *cmds.Server) error {
 	}
 
 	if len(app.Args()) > 0 {
-		return cmds.ErrCommandNoArgs
+		return util2.ErrCommandNoArgs
 	}
 
 	serverConfig.ControlConfig.DataDir = dataDir
@@ -79,7 +82,7 @@ func run(app *cli.Context, cfg *cmds.Server) error {
 	serverConfig.ControlConfig.Runtime.ClientETCDKey = filepath.Join(dataDir, "tls", "etcd", "client.key")
 	serverConfig.ControlConfig.Runtime.KubeConfigAdmin = filepath.Join(dataDir, "cred", "admin.kubeconfig")
 
-	ctx := signals.SetupSignalHandler(context.Background())
+	ctx := signals.SetupSignalContext()
 	e := etcd.NewETCD()
 	e.SetControlConfig(&serverConfig.ControlConfig)
 
@@ -88,12 +91,12 @@ func run(app *cli.Context, cfg *cmds.Server) error {
 		return err
 	}
 	if !initialized {
-		return errors.New("managed etcd database has not been initialized")
+		return fmt.Errorf("etcd database not found in %s", dataDir)
 	}
 
 	cluster := cluster.New(&serverConfig.ControlConfig)
 
-	if err := cluster.Bootstrap(ctx); err != nil {
+	if err := cluster.Bootstrap(ctx, true); err != nil {
 		return err
 	}
 
@@ -129,7 +132,7 @@ func delete(app *cli.Context, cfg *cmds.Server) error {
 	serverConfig.ControlConfig.DataDir = dataDir
 	serverConfig.ControlConfig.Runtime.KubeConfigAdmin = filepath.Join(dataDir, "cred", "admin.kubeconfig")
 
-	ctx := signals.SetupSignalHandler(context.Background())
+	ctx := signals.SetupSignalContext()
 	e := etcd.NewETCD()
 	e.SetControlConfig(&serverConfig.ControlConfig)
 
@@ -159,7 +162,7 @@ func list(app *cli.Context, cfg *cmds.Server) error {
 
 	serverConfig.ControlConfig.DataDir = dataDir
 
-	ctx := signals.SetupSignalHandler(context.Background())
+	ctx := signals.SetupSignalContext()
 	e := etcd.NewETCD()
 	e.SetControlConfig(&serverConfig.ControlConfig)
 
@@ -171,11 +174,19 @@ func list(app *cli.Context, cfg *cmds.Server) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
 	defer w.Flush()
 
-	for _, s := range sf {
-		if cfg.EtcdS3 {
-			fmt.Fprintf(w, "%s\t%d\t%s\n", s.Name, s.Size, s.CreatedAt.Format(time.RFC3339))
-		} else {
-			fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", s.Name, s.Location, s.Size, s.CreatedAt.Format(time.RFC3339))
+	if cfg.EtcdS3 {
+		fmt.Fprint(w, "Name\tSize\tCreated\n")
+		for _, s := range sf {
+			if s.NodeName == "s3" {
+				fmt.Fprintf(w, "%s\t%d\t%s\n", s.Name, s.Size, s.CreatedAt.Format(time.RFC3339))
+			}
+		}
+	} else {
+		fmt.Fprint(w, "Name\tLocation\tSize\tCreated\n")
+		for _, s := range sf {
+			if s.NodeName != "s3" {
+				fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", s.Name, s.Location, s.Size, s.CreatedAt.Format(time.RFC3339))
+			}
 		}
 	}
 
@@ -199,10 +210,17 @@ func prune(app *cli.Context, cfg *cmds.Server) error {
 
 	serverConfig.ControlConfig.DataDir = dataDir
 	serverConfig.ControlConfig.EtcdSnapshotRetention = cfg.EtcdSnapshotRetention
+	serverConfig.ControlConfig.Runtime.KubeConfigAdmin = filepath.Join(dataDir, "cred", "admin.kubeconfig")
 
-	ctx := signals.SetupSignalHandler(context.Background())
+	ctx := signals.SetupSignalContext()
 	e := etcd.NewETCD()
 	e.SetControlConfig(&serverConfig.ControlConfig)
+
+	sc, err := server.NewContext(ctx, serverConfig.ControlConfig.Runtime.KubeConfigAdmin)
+	if err != nil {
+		return err
+	}
+	serverConfig.ControlConfig.Runtime.Core = sc.Core
 
 	return e.PruneSnapshots(ctx)
 }

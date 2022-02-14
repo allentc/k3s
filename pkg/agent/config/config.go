@@ -9,7 +9,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
-	sysnet "net"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,12 +19,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/snapshots/overlay"
-	fuseoverlayfs "github.com/containerd/fuse-overlayfs-snapshotter"
 	"github.com/pkg/errors"
 	"github.com/rancher/k3s/pkg/agent/proxy"
 	"github.com/rancher/k3s/pkg/cli/cmds"
 	"github.com/rancher/k3s/pkg/clientaccess"
+	"github.com/rancher/k3s/pkg/containerd"
 	"github.com/rancher/k3s/pkg/daemons/config"
 	"github.com/rancher/k3s/pkg/daemons/control/deps"
 	"github.com/rancher/k3s/pkg/util"
@@ -32,26 +31,49 @@ import (
 	"github.com/rancher/wrangler/pkg/slice"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/json"
-	"k8s.io/apimachinery/pkg/util/net"
 )
 
 const (
 	DefaultPodManifestPath = "pod-manifests"
 )
 
+// Get returns a pointer to a completed Node configuration struct,
+// containing a merging of the local CLI configuration with settings from the server.
+// A call to this will bock until agent configuration is successfully returned by the
+// server.
 func Get(ctx context.Context, agent cmds.Agent, proxy proxy.Proxy) *config.Node {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+RETRY:
 	for {
 		agentConfig, err := get(ctx, &agent, proxy)
 		if err != nil {
-			logrus.Errorf("Failed to configure agent: %v", err)
-			select {
-			case <-time.After(5 * time.Second):
-				continue
-			case <-ctx.Done():
-				logrus.Fatalf("Interrupted")
+			logrus.Infof("Waiting to retrieve agent configuration; server is not ready: %v", err)
+			for range ticker.C {
+				continue RETRY
 			}
 		}
 		return agentConfig
+	}
+}
+
+// KubeProxyDisabled returns a bool indicating whether or not kube-proxy has been disabled in the
+// server configuration. The server may not have a complete view of cluster configuration until
+// after all startup hooks have completed, so a call to this will block until after the server's
+// readyz endpoint returns OK.
+func KubeProxyDisabled(ctx context.Context, node *config.Node, proxy proxy.Proxy) bool {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+RETRY:
+	for {
+		disabled, err := getKubeProxyDisabled(ctx, node, proxy)
+		if err != nil {
+			logrus.Infof("Waiting to retrieve kube-proxy configuration; server is not ready: %v", err)
+			for range ticker.C {
+				continue RETRY
+			}
+		}
+		return disabled
 	}
 }
 
@@ -66,7 +88,7 @@ func Request(path string, info *clientaccess.Info, requester HTTPRequester) ([]b
 	return requester(u.String(), clientaccess.GetHTTPClient(info.CACerts), info.Username, info.Password)
 }
 
-func getNodeNamedCrt(nodeName string, nodeIPs []sysnet.IP, nodePasswordFile string) HTTPRequester {
+func getNodeNamedCrt(nodeName string, nodeIPs []net.IP, nodePasswordFile string) HTTPRequester {
 	return func(u string, client *http.Client, username, password string) ([]byte, error) {
 		req, err := http.NewRequest(http.MethodGet, u, nil)
 		if err != nil {
@@ -146,7 +168,7 @@ func upgradeOldNodePasswordPath(oldNodePasswordFile, newNodePasswordFile string)
 	}
 }
 
-func getServingCert(nodeName string, nodeIPs []sysnet.IP, servingCertFile, servingKeyFile, nodePasswordFile string, info *clientaccess.Info) (*tls.Certificate, error) {
+func getServingCert(nodeName string, nodeIPs []net.IP, servingCertFile, servingKeyFile, nodePasswordFile string, info *clientaccess.Info) (*tls.Certificate, error) {
 	servingCert, err := Request("/v1-"+version.Program+"/serving-kubelet.crt", info, getNodeNamedCrt(nodeName, nodeIPs, nodePasswordFile))
 	if err != nil {
 		return nil, err
@@ -209,7 +231,7 @@ func splitCertKeyPEM(bytes []byte) (certPem []byte, keyPem []byte) {
 	return
 }
 
-func getNodeNamedHostFile(filename, keyFile, nodeName string, nodeIPs []sysnet.IP, nodePasswordFile string, info *clientaccess.Info) error {
+func getNodeNamedHostFile(filename, keyFile, nodeName string, nodeIPs []net.IP, nodePasswordFile string, info *clientaccess.Info) error {
 	basename := filepath.Base(filename)
 	fileBytes, err := Request("/v1-"+version.Program+"/"+basename, info, getNodeNamedCrt(nodeName, nodeIPs, nodePasswordFile))
 	if err != nil {
@@ -226,42 +248,6 @@ func getNodeNamedHostFile(filename, keyFile, nodeName string, nodeIPs []sysnet.I
 	return nil
 }
 
-func getHostnameAndIPs(info cmds.Agent) (string, []sysnet.IP, error) {
-	ips := []sysnet.IP{}
-	if len(info.NodeIP) == 0 {
-		hostIP, err := net.ChooseHostInterface()
-		if err != nil {
-			return "", nil, err
-		}
-		ips = append(ips, hostIP)
-	} else {
-		for _, hostIP := range info.NodeIP {
-			for _, v := range strings.Split(hostIP, ",") {
-				ip := sysnet.ParseIP(v)
-				if ip == nil {
-					return "", nil, fmt.Errorf("invalid node-ip %s", v)
-				}
-				ips = append(ips, ip)
-			}
-		}
-	}
-
-	name := info.NodeName
-	if name == "" {
-		hostname, err := os.Hostname()
-		if err != nil {
-			return "", nil, err
-		}
-		name = hostname
-	}
-
-	// Use lower case hostname to comply with kubernetes constraint:
-	// https://github.com/kubernetes/kubernetes/issues/71140
-	name = strings.ToLower(name)
-
-	return name, ips, nil
-}
-
 func isValidResolvConf(resolvConfFile string) bool {
 	file, err := os.Open(resolvConfFile)
 	if err != nil {
@@ -274,7 +260,7 @@ func isValidResolvConf(resolvConfFile string) bool {
 	for scanner.Scan() {
 		ipMatch := nameserver.FindStringSubmatch(scanner.Text())
 		if len(ipMatch) == 2 {
-			ip := sysnet.ParseIP(ipMatch[1])
+			ip := net.ParseIP(ipMatch[1])
 			if ip == nil || !ip.IsGlobalUnicast() {
 				return false
 			}
@@ -327,9 +313,9 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 		}
 	}
 
-	var flannelIface *sysnet.Interface
+	var flannelIface *net.Interface
 	if !envInfo.NoFlannel && len(envInfo.FlannelIface) > 0 {
-		flannelIface, err = sysnet.InterfaceByName(envInfo.FlannelIface)
+		flannelIface, err = net.InterfaceByName(envInfo.FlannelIface)
 		if err != nil {
 			return nil, errors.Wrapf(err, "unable to find interface")
 		}
@@ -361,9 +347,14 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	newNodePasswordFile := filepath.Join(nodeConfigPath, "password")
 	upgradeOldNodePasswordPath(oldNodePasswordFile, newNodePasswordFile)
 
-	nodeName, nodeIPs, err := getHostnameAndIPs(*envInfo)
+	nodeName, nodeIPs, err := util.GetHostnameAndIPs(envInfo.NodeName, envInfo.NodeIP)
 	if err != nil {
 		return nil, err
+	}
+
+	nodeExternalIPs, err := util.ParseStringSliceToIPs(envInfo.NodeExternalIP)
+	if err != nil {
+		return nil, fmt.Errorf("invalid node-external-ip: %w", err)
 	}
 
 	if envInfo.WithNodeID {
@@ -376,7 +367,8 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 
 	os.Setenv("NODE_NAME", nodeName)
 
-	servingCert, err := getServingCert(nodeName, nodeIPs, servingKubeletCert, servingKubeletKey, newNodePasswordFile, info)
+	nodeExternalAndInternalIPs := append(nodeIPs, nodeExternalIPs...)
+	servingCert, err := getServingCert(nodeName, nodeExternalAndInternalIPs, servingKubeletCert, servingKubeletKey, newNodePasswordFile, info)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +411,9 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 		SELinux:                  envInfo.EnableSELinux,
 		ContainerRuntimeEndpoint: envInfo.ContainerRuntimeEndpoint,
 		FlannelBackend:           controlConfig.FlannelBackend,
+		FlannelIPv6Masq:          controlConfig.FlannelIPv6Masq,
 		ServerHTTPSPort:          controlConfig.HTTPSPort,
+		Token:                    info.String(),
 	}
 	nodeConfig.FlannelIface = flannelIface
 	nodeConfig.Images = filepath.Join(envInfo.DataDir, "agent", "images")
@@ -441,29 +435,33 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	nodeConfig.AgentConfig.Snapshotter = envInfo.Snapshotter
 	nodeConfig.AgentConfig.IPSECPSK = controlConfig.IPSECPSK
 	nodeConfig.AgentConfig.StrongSwanDir = filepath.Join(envInfo.DataDir, "agent", "strongswan")
-	nodeConfig.CACerts = info.CACerts
 	nodeConfig.Containerd.Config = filepath.Join(envInfo.DataDir, "agent", "etc", "containerd", "config.toml")
 	nodeConfig.Containerd.Root = filepath.Join(envInfo.DataDir, "agent", "containerd")
 	if !nodeConfig.Docker && nodeConfig.ContainerRuntimeEndpoint == "" {
 		switch nodeConfig.AgentConfig.Snapshotter {
 		case "overlayfs":
-			if err := overlay.Supported(nodeConfig.Containerd.Root); err != nil {
+			if err := containerd.OverlaySupported(nodeConfig.Containerd.Root); err != nil {
 				return nil, errors.Wrapf(err, "\"overlayfs\" snapshotter cannot be enabled for %q, try using \"fuse-overlayfs\" or \"native\"",
 					nodeConfig.Containerd.Root)
 			}
 		case "fuse-overlayfs":
-			if err := fuseoverlayfs.Supported(nodeConfig.Containerd.Root); err != nil {
+			if err := containerd.FuseoverlayfsSupported(nodeConfig.Containerd.Root); err != nil {
 				return nil, errors.Wrapf(err, "\"fuse-overlayfs\" snapshotter cannot be enabled for %q, try using \"native\"",
 					nodeConfig.Containerd.Root)
 			}
+		case "stargz":
+			if err := containerd.StargzSupported(nodeConfig.Containerd.Root); err != nil {
+				return nil, errors.Wrapf(err, "\"stargz\" snapshotter cannot be enabled for %q, try using \"overlayfs\" or \"native\"",
+					nodeConfig.Containerd.Root)
+			}
+			nodeConfig.AgentConfig.ImageServiceSocket = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
 		}
 	}
 	nodeConfig.Containerd.Opt = filepath.Join(envInfo.DataDir, "agent", "containerd")
 	if !envInfo.Debug {
 		nodeConfig.Containerd.Log = filepath.Join(envInfo.DataDir, "agent", "containerd", "containerd.log")
 	}
-	nodeConfig.Containerd.State = "/run/k3s/containerd"
-	nodeConfig.Containerd.Address = filepath.Join(nodeConfig.Containerd.State, "containerd.sock")
+	applyContainerdStateAndAddress(nodeConfig)
 	nodeConfig.Containerd.Template = filepath.Join(envInfo.DataDir, "agent", "etc", "containerd", "config.toml.tmpl")
 	nodeConfig.Certificate = servingCert
 
@@ -473,16 +471,7 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 		return nil, errors.Wrap(err, "cannot configure IPv4 node-ip")
 	}
 	nodeConfig.AgentConfig.NodeIP = nodeIP.String()
-
-	for _, externalIP := range envInfo.NodeExternalIP {
-		for _, v := range strings.Split(externalIP, ",") {
-			ip := sysnet.ParseIP(v)
-			if ip == nil {
-				return nil, fmt.Errorf("invalid node-external-ip %s", v)
-			}
-			nodeConfig.AgentConfig.NodeExternalIPs = append(nodeConfig.AgentConfig.NodeExternalIPs, ip)
-		}
-	}
+	nodeConfig.AgentConfig.NodeExternalIPs = nodeExternalIPs
 
 	// if configured, set NodeExternalIP to the first IPv4 address, for legacy clients
 	if len(nodeConfig.AgentConfig.NodeExternalIPs) > 0 {
@@ -506,9 +495,9 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 		}
 
 		if envInfo.FlannelConf == "" {
-			nodeConfig.FlannelConf = filepath.Join(envInfo.DataDir, "agent", "etc", "flannel", "net-conf.json")
+			nodeConfig.FlannelConfFile = filepath.Join(envInfo.DataDir, "agent", "etc", "flannel", "net-conf.json")
 		} else {
-			nodeConfig.FlannelConf = envInfo.FlannelConf
+			nodeConfig.FlannelConfFile = envInfo.FlannelConf
 			nodeConfig.FlannelConfOverride = true
 		}
 		nodeConfig.AgentConfig.CNIBinDir = filepath.Dir(hostLocal)
@@ -524,7 +513,7 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 
 	if controlConfig.ClusterIPRange != nil {
 		nodeConfig.AgentConfig.ClusterCIDR = controlConfig.ClusterIPRange
-		nodeConfig.AgentConfig.ClusterCIDRs = []*sysnet.IPNet{controlConfig.ClusterIPRange}
+		nodeConfig.AgentConfig.ClusterCIDRs = []*net.IPNet{controlConfig.ClusterIPRange}
 	}
 
 	if len(controlConfig.ClusterIPRanges) > 0 {
@@ -533,7 +522,7 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 
 	if controlConfig.ServiceIPRange != nil {
 		nodeConfig.AgentConfig.ServiceCIDR = controlConfig.ServiceIPRange
-		nodeConfig.AgentConfig.ServiceCIDRs = []*sysnet.IPNet{controlConfig.ServiceIPRange}
+		nodeConfig.AgentConfig.ServiceCIDRs = []*net.IPNet{controlConfig.ServiceIPRange}
 	}
 
 	if len(controlConfig.ServiceIPRanges) > 0 {
@@ -545,7 +534,7 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	}
 
 	if len(controlConfig.ClusterDNSs) == 0 {
-		nodeConfig.AgentConfig.ClusterDNSs = []sysnet.IP{controlConfig.ClusterDNS}
+		nodeConfig.AgentConfig.ClusterDNSs = []net.IP{controlConfig.ClusterDNS}
 	} else {
 		nodeConfig.AgentConfig.ClusterDNSs = controlConfig.ClusterDNSs
 	}
@@ -573,10 +562,10 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	nodeConfig.AgentConfig.PrivateRegistry = envInfo.PrivateRegistry
 	nodeConfig.AgentConfig.DisableCCM = controlConfig.DisableCCM
 	nodeConfig.AgentConfig.DisableNPC = controlConfig.DisableNPC
-	nodeConfig.AgentConfig.DisableKubeProxy = controlConfig.DisableKubeProxy
 	nodeConfig.AgentConfig.Rootless = envInfo.Rootless
 	nodeConfig.AgentConfig.PodManifests = filepath.Join(envInfo.DataDir, "agent", DefaultPodManifestPath)
 	nodeConfig.AgentConfig.ProtectKernelDefaults = envInfo.ProtectKernelDefaults
+	nodeConfig.AgentConfig.DisableServiceLB = envInfo.DisableServiceLB
 
 	if err := validateNetworkConfig(nodeConfig); err != nil {
 		return nil, err
@@ -585,6 +574,32 @@ func get(ctx context.Context, envInfo *cmds.Agent, proxy proxy.Proxy) (*config.N
 	return nodeConfig, nil
 }
 
+// getKubeProxyDisabled attempts to return the DisableKubeProxy setting from the server configuration data.
+// It first checks the server readyz endpoint, to ensure that the configuration has stabilized before use.
+func getKubeProxyDisabled(ctx context.Context, node *config.Node, proxy proxy.Proxy) (bool, error) {
+	info, err := clientaccess.ParseAndValidateToken(proxy.SupervisorURL(), node.Token)
+	if err != nil {
+		return false, err
+	}
+
+	// 500 error indicates that the health check has failed; other errors (for example 401 Unauthorized)
+	// indicate that the server is down-level and doesn't support readyz, so we should just use whatever
+	// the server has for us.
+	if err := getReadyz(info); err != nil && strings.HasSuffix(err.Error(), "500 Internal Server Error") {
+		return false, err
+	}
+
+	controlConfig, err := getConfig(info)
+	if err != nil {
+		return false, errors.Wrap(err, "failed to retrieve configuration from server")
+	}
+
+	return controlConfig.DisableKubeProxy, nil
+}
+
+// getConfig returns server configuration data. Note that this may be mutated during system startup; anything that needs
+// to ensure stable system state should check the readyz endpoint first. This is required because RKE2 starts up the
+// kubelet early, before the apiserver is available.
 func getConfig(info *clientaccess.Info) (*config.Control, error) {
 	data, err := info.Get("/v1-" + version.Program + "/config")
 	if err != nil {
@@ -593,6 +608,12 @@ func getConfig(info *clientaccess.Info) (*config.Control, error) {
 
 	controlControl := &config.Control{}
 	return controlControl, json.Unmarshal(data, controlControl)
+}
+
+// getReadyz returns nil if the server is ready, or an error if not.
+func getReadyz(info *clientaccess.Info) error {
+	_, err := info.Get("/v1-" + version.Program + "/readyz")
+	return err
 }
 
 // validateNetworkConfig ensures that the network configuration values provided by the server make sense.

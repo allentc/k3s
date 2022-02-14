@@ -16,6 +16,7 @@ type Agent struct {
 	ServerURL                string
 	APIAddressCh             chan string
 	DisableLoadBalancer      bool
+	DisableServiceLB         bool
 	ETCDAgent                bool
 	LBServerPort             int
 	ResolvConf               string
@@ -46,6 +47,7 @@ type Agent struct {
 	Taints                   cli.StringSlice
 	ImageCredProvBinDir      string
 	ImageCredProvConfig      string
+	AgentReady               chan<- struct{}
 	AgentShared
 }
 
@@ -54,9 +56,15 @@ type AgentShared struct {
 }
 
 var (
-	appName     = filepath.Base(os.Args[0])
-	AgentConfig Agent
-	NodeIPFlag  = cli.StringSliceFlag{
+	appName        = filepath.Base(os.Args[0])
+	AgentConfig    Agent
+	AgentTokenFlag = cli.StringFlag{
+		Name:        "token,t",
+		Usage:       "(cluster) Token to use for authentication",
+		EnvVar:      version.ProgramUpper + "_TOKEN",
+		Destination: &AgentConfig.Token,
+	}
+	NodeIPFlag = cli.StringSliceFlag{
 		Name:  "node-ip,i",
 		Usage: "(agent/networking) IPv4/IPv6 addresses to advertise for node",
 		Value: &AgentConfig.NodeIP,
@@ -103,13 +111,13 @@ var (
 		Name:        "pause-image",
 		Usage:       "(agent/runtime) Customized pause image for containerd or docker sandbox",
 		Destination: &AgentConfig.PauseImage,
-		Value:       "rancher/pause:3.1",
+		Value:       DefaultPauseImage,
 	}
 	SnapshotterFlag = cli.StringFlag{
 		Name:        "snapshotter",
 		Usage:       "(agent/runtime) Override default containerd snapshotter",
 		Destination: &AgentConfig.Snapshotter,
-		Value:       "overlayfs",
+		Value:       DefaultSnapshotter,
 	}
 	FlannelFlag = cli.BoolFlag{
 		Name:        "no-flannel",
@@ -206,7 +214,7 @@ func NewAgentCommand(action func(ctx *cli.Context) error) cli.Command {
 		Name:      "agent",
 		Usage:     "Run node agent",
 		UsageText: appName + " agent [OPTIONS]",
-		Before:    SetupDebug(CheckSELinuxFlags),
+		Before:    CheckSELinuxFlags,
 		Action:    action,
 		Flags: []cli.Flag{
 			ConfigFlag,
@@ -215,12 +223,7 @@ func NewAgentCommand(action func(ctx *cli.Context) error) cli.Command {
 			VModule,
 			LogFile,
 			AlsoLogToStderr,
-			cli.StringFlag{
-				Name:        "token,t",
-				Usage:       "(cluster) Token to use for authentication",
-				EnvVar:      version.ProgramUpper + "_TOKEN",
-				Destination: &AgentConfig.Token,
-			},
+			AgentTokenFlag,
 			cli.StringFlag{
 				Name:        "token-file",
 				Usage:       "(cluster) Token file to use for authentication",

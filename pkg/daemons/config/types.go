@@ -8,9 +8,10 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/k3s-io/kine/pkg/endpoint"
-	"github.com/rancher/wrangler-api/pkg/generated/controllers/core"
+	"github.com/rancher/wrangler/pkg/generated/controllers/core"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 )
@@ -30,13 +31,14 @@ type Node struct {
 	NoFlannel                bool
 	SELinux                  bool
 	FlannelBackend           string
-	FlannelConf              string
+	FlannelConfFile          string
 	FlannelConfOverride      bool
 	FlannelIface             *net.Interface
+	FlannelIPv6Masq          bool
 	Containerd               Containerd
 	Images                   string
 	AgentConfig              Agent
-	CACerts                  []byte
+	Token                    string
 	Certificate              *tls.Certificate
 	ServerHTTPSPort          int
 }
@@ -76,6 +78,7 @@ type Agent struct {
 	NodeExternalIP          string
 	NodeExternalIPs         []net.IP
 	RuntimeSocket           string
+	ImageServiceSocket      string
 	ListenAddress           string
 	ClientCA                string
 	CNIBinDir               string
@@ -96,12 +99,32 @@ type Agent struct {
 	AirgapExtraRegistry     []string
 	DisableCCM              bool
 	DisableNPC              bool
-	DisableKubeProxy        bool
 	Rootless                bool
 	ProtectKernelDefaults   bool
+	DisableServiceLB        bool
+	EnableIPv6              bool
+}
+
+// CriticalControlArgs contains parameters that all control plane nodes in HA must share
+type CriticalControlArgs struct {
+	ClusterDNSs           []net.IP
+	ClusterIPRanges       []*net.IPNet
+	ClusterDNS            net.IP
+	ClusterDomain         string
+	ClusterIPRange        *net.IPNet
+	DisableCCM            bool
+	DisableHelmController bool
+	DisableNPC            bool
+	DisableServiceLB      bool
+	FlannelBackend        string
+	FlannelIPv6Masq       bool
+	NoCoreDNS             bool
+	ServiceIPRange        *net.IPNet
+	ServiceIPRanges       []*net.IPNet
 }
 
 type Control struct {
+	CriticalControlArgs
 	AdvertisePort int
 	AdvertiseIP   string
 	// The port which kubectl clients can access k8s
@@ -113,42 +136,34 @@ type Control struct {
 	APIServerBindAddress     string
 	AgentToken               string `json:"-"`
 	Token                    string `json:"-"`
-	ClusterIPRange           *net.IPNet
-	ClusterIPRanges          []*net.IPNet
-	ServiceIPRange           *net.IPNet
-	ServiceIPRanges          []*net.IPNet
 	ServiceNodePortRange     *utilnet.PortRange
-	ClusterDNS               net.IP
-	ClusterDNSs              []net.IP
-	ClusterDomain            string
-	NoCoreDNS                bool
 	KubeConfigOutput         string
 	KubeConfigMode           string
 	DataDir                  string
-	Skips                    map[string]bool
-	Disables                 map[string]bool
 	Datastore                endpoint.Config
+	Disables                 map[string]bool
+	DisableAPIServer         bool
+	DisableControllerManager bool
+	DisableETCD              bool
+	DisableKubeProxy         bool
+	DisableScheduler         bool
 	ExtraAPIArgs             []string
 	ExtraControllerArgs      []string
 	ExtraCloudControllerArgs []string
+	ExtraEtcdArgs            []string
 	ExtraSchedulerAPIArgs    []string
 	NoLeaderElect            bool
 	JoinURL                  string
-	FlannelBackend           string
 	IPSECPSK                 string
 	DefaultLocalStoragePath  string
+	Skips                    map[string]bool
 	SystemDefaultRegistry    string
-	DisableCCM               bool
-	DisableNPC               bool
-	DisableKubeProxy         bool
-	DisableAPIServer         bool
-	DisableControllerManager bool
-	DisableScheduler         bool
-	DisableETCD              bool
 	ClusterInit              bool
 	ClusterReset             bool
 	ClusterResetRestorePath  string
 	EncryptSecrets           bool
+	EncryptForce             bool
+	EncryptSkip              bool
 	TLSMinVersion            uint16
 	TLSCipherSuites          []uint16
 	EtcdSnapshotName         string
@@ -157,6 +172,7 @@ type Control struct {
 	EtcdSnapshotDir          string
 	EtcdSnapshotCron         string
 	EtcdSnapshotRetention    int
+	EtcdSnapshotCompress     bool
 	EtcdS3                   bool
 	EtcdS3Endpoint           string
 	EtcdS3EndpointCA         string
@@ -166,6 +182,9 @@ type Control struct {
 	EtcdS3BucketName         string
 	EtcdS3Region             string
 	EtcdS3Folder             string
+	EtcdS3Timeout            time.Duration
+	EtcdS3Insecure           bool
+	ServerNodeName           string
 
 	BindAddress string
 	SANs        []string
@@ -188,15 +207,18 @@ type ControlRuntimeBootstrap struct {
 	RequestHeaderCAKey string
 	IPSECKey           string
 	EncryptionConfig   string
+	EncryptionHash     string
 }
 
 type ControlRuntime struct {
 	ControlRuntimeBootstrap
 
-	HTTPBootstrap          bool
-	APIServerReady         <-chan struct{}
-	ETCDReady              <-chan struct{}
-	ClusterControllerStart func(ctx context.Context) error
+	HTTPBootstrap                       bool
+	APIServerReady                      <-chan struct{}
+	AgentReady                          <-chan struct{}
+	ETCDReady                           <-chan struct{}
+	ClusterControllerStart              func(ctx context.Context) error
+	LeaderElectedClusterControllerStart func(ctx context.Context) error
 
 	ClientKubeAPICert string
 	ClientKubeAPIKey  string
@@ -213,6 +235,7 @@ type ControlRuntime struct {
 	ServingKubeletKey  string
 	ServerToken        string
 	AgentToken         string
+	APIServer          http.Handler
 	Handler            http.Handler
 	Tunnel             http.Handler
 	Authenticator      authenticator.Request
@@ -241,7 +264,8 @@ type ControlRuntime struct {
 	ClientETCDCert           string
 	ClientETCDKey            string
 
-	Core *core.Factory
+	Core       *core.Factory
+	EtcdConfig endpoint.ETCDConfig
 }
 
 type ArgString []string
@@ -257,10 +281,13 @@ func (a ArgString) String() string {
 	return b.String()
 }
 
-func GetArgsList(argsMap map[string]string, extraArgs []string) []string {
+// GetArgs appends extra arguments to existing arguments overriding any default options.
+func GetArgs(argsMap map[string]string, extraArgs []string) []string {
+	const hyphens = "--"
+
 	// add extra args to args map to override any default option
 	for _, arg := range extraArgs {
-		splitArg := strings.SplitN(arg, "=", 2)
+		splitArg := strings.SplitN(strings.TrimPrefix(arg, hyphens), "=", 2)
 		if len(splitArg) < 2 {
 			argsMap[splitArg[0]] = "true"
 			continue
@@ -269,7 +296,7 @@ func GetArgsList(argsMap map[string]string, extraArgs []string) []string {
 	}
 	var args []string
 	for arg, value := range argsMap {
-		cmd := fmt.Sprintf("--%s=%s", arg, value)
+		cmd := fmt.Sprintf("%s%s=%s", hyphens, strings.TrimPrefix(arg, hyphens), value)
 		args = append(args, cmd)
 	}
 	sort.Strings(args)

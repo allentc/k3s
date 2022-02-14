@@ -6,12 +6,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-
-	"sigs.k8s.io/yaml"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/rancher/k3s/pkg/cli/cmds"
 	daemonconfig "github.com/rancher/k3s/pkg/daemons/config"
+	yaml2 "gopkg.in/yaml.v2"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -20,13 +23,15 @@ var (
 
 type Executor interface {
 	Bootstrap(ctx context.Context, nodeConfig *daemonconfig.Node, cfg cmds.Agent) error
-	Kubelet(args []string) error
-	KubeProxy(args []string) error
-	APIServer(ctx context.Context, etcdReady <-chan struct{}, args []string) (authenticator.Request, http.Handler, error)
-	Scheduler(apiReady <-chan struct{}, args []string) error
-	ControllerManager(apiReady <-chan struct{}, args []string) error
+	Kubelet(ctx context.Context, args []string) error
+	KubeProxy(ctx context.Context, args []string) error
+	APIServerHandlers(ctx context.Context) (authenticator.Request, http.Handler, error)
+	APIServer(ctx context.Context, etcdReady <-chan struct{}, args []string) error
+	Scheduler(ctx context.Context, apiReady <-chan struct{}, args []string) error
+	ControllerManager(ctx context.Context, apiReady <-chan struct{}, args []string) error
 	CurrentETCDOptions() (InitialOptions, error)
-	ETCD(args ETCDConfig) error
+	ETCD(ctx context.Context, args ETCDConfig, extraArgs []string) error
+	CloudControllerManager(ctx context.Context, ccmRBACReady <-chan struct{}, args []string) error
 }
 
 type ETCDConfig struct {
@@ -67,11 +72,51 @@ type InitialOptions struct {
 	State            string `json:"initial-cluster-state,omitempty"`
 }
 
-func (e ETCDConfig) ToConfigFile() (string, error) {
+func (e ETCDConfig) ToConfigFile(extraArgs []string) (string, error) {
 	confFile := filepath.Join(e.DataDir, "config")
 	bytes, err := yaml.Marshal(&e)
 	if err != nil {
 		return "", err
+	}
+
+	if len(extraArgs) > 0 {
+		var s map[string]interface{}
+		if err := yaml2.Unmarshal(bytes, &s); err != nil {
+			return "", err
+		}
+
+		for _, v := range extraArgs {
+			extraArg := strings.SplitN(v, "=", 2)
+			// Depending on the argV, we have different types to handle.
+			// Source: https://github.com/etcd-io/etcd/blob/44b8ae145b505811775f5af915dd19198d556d55/server/config/config.go#L36-L190 and https://etcd.io/docs/v3.5/op-guide/configuration/#configuration-file
+			if len(extraArg) == 2 {
+				key := strings.TrimLeft(extraArg[0], "-")
+				lowerKey := strings.ToLower(key)
+				var stringArr []string
+				if i, err := strconv.Atoi(extraArg[1]); err == nil {
+					s[key] = i
+				} else if time, err := time.ParseDuration(extraArg[1]); err == nil && (strings.Contains(lowerKey, "time") || strings.Contains(lowerKey, "duration") || strings.Contains(lowerKey, "interval") || strings.Contains(lowerKey, "retention")) {
+					// auto-compaction-retention is either a time.Duration or int, depending on version. If it is an int, it will be caught above.
+					s[key] = time
+				} else if err := yaml.Unmarshal([]byte(extraArg[1]), &stringArr); err == nil {
+					s[key] = stringArr
+				} else {
+					switch strings.ToLower(extraArg[1]) {
+					case "true":
+						s[key] = true
+					case "false":
+						s[key] = false
+					default:
+						s[key] = extraArg[1]
+					}
+				}
+			}
+		}
+
+		bytes, err = yaml2.Marshal(&s)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	if err := os.MkdirAll(e.DataDir, 0700); err != nil {
@@ -88,30 +133,38 @@ func Bootstrap(ctx context.Context, nodeConfig *daemonconfig.Node, cfg cmds.Agen
 	return executor.Bootstrap(ctx, nodeConfig, cfg)
 }
 
-func Kubelet(args []string) error {
-	return executor.Kubelet(args)
+func Kubelet(ctx context.Context, args []string) error {
+	return executor.Kubelet(ctx, args)
 }
 
-func KubeProxy(args []string) error {
-	return executor.KubeProxy(args)
+func KubeProxy(ctx context.Context, args []string) error {
+	return executor.KubeProxy(ctx, args)
 }
 
-func APIServer(ctx context.Context, etcdReady <-chan struct{}, args []string) (authenticator.Request, http.Handler, error) {
+func APIServerHandlers(ctx context.Context) (authenticator.Request, http.Handler, error) {
+	return executor.APIServerHandlers(ctx)
+}
+
+func APIServer(ctx context.Context, etcdReady <-chan struct{}, args []string) error {
 	return executor.APIServer(ctx, etcdReady, args)
 }
 
-func Scheduler(apiReady <-chan struct{}, args []string) error {
-	return executor.Scheduler(apiReady, args)
+func Scheduler(ctx context.Context, apiReady <-chan struct{}, args []string) error {
+	return executor.Scheduler(ctx, apiReady, args)
 }
 
-func ControllerManager(apiReady <-chan struct{}, args []string) error {
-	return executor.ControllerManager(apiReady, args)
+func ControllerManager(ctx context.Context, apiReady <-chan struct{}, args []string) error {
+	return executor.ControllerManager(ctx, apiReady, args)
 }
 
 func CurrentETCDOptions() (InitialOptions, error) {
 	return executor.CurrentETCDOptions()
 }
 
-func ETCD(args ETCDConfig) error {
-	return executor.ETCD(args)
+func ETCD(ctx context.Context, args ETCDConfig, extraArgs []string) error {
+	return executor.ETCD(ctx, args, extraArgs)
+}
+
+func CloudControllerManager(ctx context.Context, ccmRBACReady <-chan struct{}, args []string) error {
+	return executor.CloudControllerManager(ctx, ccmRBACReady, args)
 }

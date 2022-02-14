@@ -2,8 +2,6 @@ package containerd
 
 import (
 	"bufio"
-	"compress/bzip2"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -17,26 +15,20 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/pkg/cri/constants"
 	"github.com/containerd/containerd/reference/docker"
-	"github.com/klauspost/compress/zstd"
 	"github.com/natefinch/lumberjack"
-	"github.com/opencontainers/runc/libcontainer/system"
-	"github.com/pierrec/lz4"
 	"github.com/pkg/errors"
-	"github.com/rancher/k3s/pkg/agent/templates"
 	util2 "github.com/rancher/k3s/pkg/agent/util"
-	"github.com/rancher/k3s/pkg/daemons/agent"
 	"github.com/rancher/k3s/pkg/daemons/config"
-	"github.com/rancher/k3s/pkg/untar"
 	"github.com/rancher/k3s/pkg/version"
-	"github.com/rancher/wharfie/pkg/registries"
+	"github.com/rancher/wharfie/pkg/tarfile"
 	"github.com/rancher/wrangler/pkg/merr"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/kubelet/util"
 )
 
 const (
@@ -46,20 +38,10 @@ const (
 // Run configures and starts containerd as a child process. Once it is up, images are preloaded
 // or pulled from files found in the agent images directory.
 func Run(ctx context.Context, cfg *config.Node) error {
-	args := []string{
-		"containerd",
-		"-c", cfg.Containerd.Config,
-		"-a", cfg.Containerd.Address,
-		"--state", cfg.Containerd.State,
-		"--root", cfg.Containerd.Root,
-	}
+	args := getContainerdArgs(cfg)
 
 	if err := setupContainerdConfig(ctx, cfg); err != nil {
 		return err
-	}
-
-	if os.Getenv("CONTAINERD_LOG_LEVEL") != "" {
-		args = append(args, "-l", os.Getenv("CONTAINERD_LOG_LEVEL"))
 	}
 
 	stdOut := io.Writer(os.Stdout)
@@ -78,18 +60,33 @@ func Run(ctx context.Context, cfg *config.Node) error {
 	}
 
 	go func() {
-		logrus.Infof("Running containerd %s", config.ArgString(args[1:]))
-		cmd := exec.Command(args[0], args[1:]...)
-		cmd.Stdout = stdOut
-		cmd.Stderr = stdErr
-		cmd.Env = os.Environ()
-		// elide NOTIFY_SOCKET to prevent spurious notifications to systemd
-		for i := range cmd.Env {
-			if strings.HasPrefix(cmd.Env[i], "NOTIFY_SOCKET=") {
-				cmd.Env = append(cmd.Env[:i], cmd.Env[i+1:]...)
-				break
+		env := []string{}
+
+		for _, e := range os.Environ() {
+			pair := strings.SplitN(e, "=", 2)
+			switch {
+			case pair[0] == "NOTIFY_SOCKET":
+				// elide NOTIFY_SOCKET to prevent spurious notifications to systemd
+			case pair[0] == "CONTAINERD_LOG_LEVEL":
+				// Turn CONTAINERD_LOG_LEVEL variable into log-level flag
+				args = append(args, "--log-level", pair[1])
+			case strings.HasPrefix(pair[0], "CONTAINERD_"):
+				// Strip variables with CONTAINERD_ prefix before passing through
+				// This allows doing things like setting a proxy for image pulls by setting
+				// CONTAINERD_https_proxy=http://proxy.example.com:8080
+				pair[0] = strings.TrimPrefix(pair[0], "CONTAINERD_")
+				fallthrough
+			default:
+				env = append(env, strings.Join(pair, "="))
 			}
 		}
+
+		logrus.Infof("Running containerd %s", config.ArgString(args[1:]))
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		cmd.Stdout = stdOut
+		cmd.Stderr = stdErr
+		cmd.Env = env
+
 		addDeathSig(cmd)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "containerd: %s\n", err)
@@ -97,9 +94,20 @@ func Run(ctx context.Context, cfg *config.Node) error {
 		os.Exit(1)
 	}()
 
+	if err := WaitForContainerd(ctx, cfg.Containerd.Address); err != nil {
+		return err
+	}
+
+	return preloadImages(ctx, cfg)
+}
+
+// WaitForContainerd blocks in a retry loop until the Containerd CRI service
+// is functional at the provided socket address. It will return only on success,
+// or when the context is cancelled.
+func WaitForContainerd(ctx context.Context, address string) error {
 	first := true
 	for {
-		conn, err := CriConnection(ctx, cfg.Containerd.Address)
+		conn, err := CriConnection(ctx, address)
 		if err == nil {
 			conn.Close()
 			break
@@ -116,32 +124,7 @@ func Run(ctx context.Context, cfg *config.Node) error {
 		}
 	}
 	logrus.Info("Containerd is now running")
-
-	return preloadImages(ctx, cfg)
-}
-
-// criConnection connects to a CRI socket at the given path.
-func CriConnection(ctx context.Context, address string) (*grpc.ClientConn, error) {
-	addr, dialer, err := util.GetAddressAndDialer("unix://" + address)
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(3*time.Second), grpc.WithContextDialer(dialer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
-	if err != nil {
-		return nil, err
-	}
-
-	c := runtimeapi.NewRuntimeServiceClient(conn)
-	_, err = c.Version(ctx, &runtimeapi.VersionRequest{
-		Version: "0.1.0",
-	})
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	return conn, nil
+	return nil
 }
 
 // preloadImages reads the contents of the agent images directory, and attempts to
@@ -179,13 +162,31 @@ func preloadImages(ctx context.Context, cfg *config.Node) error {
 	}
 	defer criConn.Close()
 
-	// Ensure that nothing else can modify the image store while we're importing,
-	// and that our images are imported into the k8s.io namespace
-	ctx, done, err := client.WithLease(namespaces.WithNamespace(ctx, "k8s.io"))
+	// Ensure that our images are imported into the correct namespace
+	ctx = namespaces.WithNamespace(ctx, constants.K8sContainerdNamespace)
+
+	// At startup all leases from k3s are cleared
+	ls := client.LeasesService()
+	existingLeases, err := ls.List(ctx)
 	if err != nil {
 		return err
 	}
-	defer done(ctx)
+
+	for _, lease := range existingLeases {
+		if lease.ID == version.Program {
+			logrus.Debugf("Deleting existing lease: %v", lease)
+			ls.Delete(ctx, lease)
+		}
+	}
+
+	// Any images found on import are given a lease that never expires
+	lease, err := ls.Create(ctx, leases.WithID(version.Program))
+	if err != nil {
+		return err
+	}
+
+	// Ensure that our images are locked by the lease
+	ctx = leases.WithLease(ctx, lease.ID)
 
 	for _, fileInfo := range fileInfos {
 		if fileInfo.IsDir() {
@@ -199,7 +200,7 @@ func preloadImages(ctx context.Context, cfg *config.Node) error {
 			logrus.Errorf("Error encountered while importing %s: %v", filePath, err)
 			continue
 		}
-		logrus.Debugf("Imported images from %s in %s", filePath, time.Since(start))
+		logrus.Infof("Imported images from %s in %s", filePath, time.Since(start))
 	}
 	return nil
 }
@@ -208,39 +209,26 @@ func preloadImages(ctx context.Context, cfg *config.Node) error {
 // This is in its own function so that we can ensure that the various readers are properly closed, as some
 // decompressing readers need to be explicitly closed and others do not.
 func preloadFile(ctx context.Context, cfg *config.Node, client *containerd.Client, criConn *grpc.ClientConn, filePath string) error {
-	file, err := os.Open(filePath)
+	if util2.HasSuffixI(filePath, ".txt") {
+		file, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		logrus.Infof("Pulling images from %s", filePath)
+		return prePullImages(ctx, criConn, file)
+	}
+
+	opener, err := tarfile.GetOpener(filePath)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
-	var imageReader io.Reader
-	switch {
-	case util2.HasSuffixI(filePath, ".txt"):
-		return prePullImages(ctx, criConn, file)
-	case util2.HasSuffixI(filePath, ".tar"):
-		imageReader = file
-	case util2.HasSuffixI(filePath, ".tar.lz4"):
-		imageReader = lz4.NewReader(file)
-	case util2.HasSuffixI(filePath, ".tar.bz2", ".tbz"):
-		imageReader = bzip2.NewReader(file)
-	case util2.HasSuffixI(filePath, ".tar.gz", ".tgz"):
-		zr, err := gzip.NewReader(file)
-		if err != nil {
-			return err
-		}
-		defer zr.Close()
-		imageReader = zr
-	case util2.HasSuffixI(filePath, "tar.zst", ".tzst"):
-		zr, err := zstd.NewReader(file, zstd.WithDecoderMaxMemory(untar.MaxDecoderMemory))
-		if err != nil {
-			return err
-		}
-		defer zr.Close()
-		imageReader = zr
-	default:
-		return errors.New("unhandled file type")
+	imageReader, err := opener()
+	if err != nil {
+		return err
 	}
+	defer imageReader.Close()
 
 	logrus.Infof("Importing images from %s", filePath)
 
@@ -329,57 +317,4 @@ func prePullImages(ctx context.Context, conn *grpc.ClientConn, images io.Reader)
 		}
 	}
 	return nil
-}
-
-// setupContainerdConfig generates the containerd.toml, using a template combined with various
-// runtime configurations and registry mirror settings provided by the administrator.
-func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
-	privRegistries, err := registries.GetPrivateRegistries(cfg.AgentConfig.PrivateRegistry)
-	if err != nil {
-		return err
-	}
-
-	isRunningInUserNS := system.RunningInUserNS()
-	_, _, hasCFS, hasPIDs := agent.CheckCgroups()
-	// "/sys/fs/cgroup" is namespaced
-	cgroupfsWritable := unix.Access("/sys/fs/cgroup", unix.W_OK) == nil
-	disableCgroup := isRunningInUserNS && (!hasCFS || !hasPIDs || !cgroupfsWritable)
-	if disableCgroup {
-		logrus.Warn("cgroup v2 controllers are not delegated for rootless. Disabling cgroup.")
-	}
-
-	var containerdTemplate string
-	containerdConfig := templates.ContainerdConfig{
-		NodeConfig:            cfg,
-		DisableCgroup:         disableCgroup,
-		IsRunningInUserNS:     isRunningInUserNS,
-		PrivateRegistryConfig: privRegistries.Registry(),
-	}
-
-	selEnabled, selConfigured, err := selinuxStatus()
-	if err != nil {
-		return errors.Wrap(err, "failed to detect selinux")
-	}
-	switch {
-	case !cfg.SELinux && selEnabled:
-		logrus.Warn("SELinux is enabled on this host, but " + version.Program + " has not been started with --selinux - containerd SELinux support is disabled")
-	case cfg.SELinux && !selConfigured:
-		logrus.Warnf("SELinux is enabled for "+version.Program+" but process is not running in context '%s', "+version.Program+"-selinux policy may need to be applied", SELinuxContextType)
-	}
-
-	containerdTemplateBytes, err := ioutil.ReadFile(cfg.Containerd.Template)
-	if err == nil {
-		logrus.Infof("Using containerd template at %s", cfg.Containerd.Template)
-		containerdTemplate = string(containerdTemplateBytes)
-	} else if os.IsNotExist(err) {
-		containerdTemplate = templates.ContainerdConfigTemplate
-	} else {
-		return err
-	}
-	parsedTemplate, err := templates.ParseTemplateFromConfig(containerdTemplate, containerdConfig)
-	if err != nil {
-		return err
-	}
-
-	return util2.WriteFile(cfg.Containerd.Config, parsedTemplate)
 }

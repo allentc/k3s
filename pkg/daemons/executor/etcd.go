@@ -1,24 +1,26 @@
+//go:build !no_embedded_executor
 // +build !no_embedded_executor
 
 package executor
 
 import (
+	"context"
+	"errors"
 	"io/ioutil"
 	"path/filepath"
-	"strings"
 
 	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
-	"go.etcd.io/etcd/embed"
-	"go.etcd.io/etcd/etcdserver"
+	"go.etcd.io/etcd/server/v3/embed"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
 )
 
 func (e Embedded) CurrentETCDOptions() (InitialOptions, error) {
 	return InitialOptions{}, nil
 }
 
-func (e Embedded) ETCD(args ETCDConfig) error {
-	configFile, err := args.ToConfigFile()
+func (e Embedded) ETCD(ctx context.Context, args ETCDConfig, extraArgs []string) error {
+	configFile, err := args.ToConfigFile(extraArgs)
 	if err != nil {
 		return err
 	}
@@ -26,15 +28,16 @@ func (e Embedded) ETCD(args ETCDConfig) error {
 	if err != nil {
 		return err
 	}
+
 	etcd, err := embed.StartEtcd(cfg)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	go func() {
 		select {
 		case err := <-etcd.Server.ErrNotify():
-			if strings.Contains(err.Error(), etcdserver.ErrMemberRemoved.Error()) {
+			if errors.Is(err, rafthttp.ErrMemberRemoved) {
 				tombstoneFile := filepath.Join(args.DataDir, "tombstone")
 				if err := ioutil.WriteFile(tombstoneFile, []byte{}, 0600); err != nil {
 					logrus.Fatalf("failed to write tombstone file to %s", tombstoneFile)
@@ -42,7 +45,9 @@ func (e Embedded) ETCD(args ETCDConfig) error {
 				logrus.Infof("this node has been removed from the cluster please restart %s to rejoin the cluster", version.Program)
 				return
 			}
-
+		case <-ctx.Done():
+			logrus.Infof("stopping etcd")
+			etcd.Close()
 		case <-etcd.Server.StopNotify():
 			logrus.Fatalf("etcd stopped")
 		case err := <-etcd.Err():

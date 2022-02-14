@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -23,9 +22,17 @@ func Run(ctx *cli.Context) error {
 	// database credentials or other secrets.
 	gspt.SetProcTitle(os.Args[0] + " agent")
 
+	// Evacuate cgroup v2 before doing anything else that may fork.
+	if err := cmds.EvacuateCgroup2(); err != nil {
+		return err
+	}
+
+	// Initialize logging, and subprocess reaping if necessary.
+	// Log output redirection and subprocess reaping both require forking.
 	if err := cmds.InitLogging(); err != nil {
 		return err
 	}
+
 	if os.Getuid() != 0 && runtime.GOOS != "windows" {
 		return fmt.Errorf("agent must be ran as root")
 	}
@@ -65,7 +72,7 @@ func Run(ctx *cli.Context) error {
 	cfg.Debug = ctx.GlobalBool("debug")
 	cfg.DataDir = dataDir
 
-	contextCtx := signals.SetupSignalHandler(context.Background())
+	contextCtx := signals.SetupSignalContext()
 
 	return agent.Run(contextCtx, cfg)
 }

@@ -4,15 +4,14 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
-	"syscall"
 
-	"github.com/google/tcpproxy"
 	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
+	"inet.af/tcpproxy"
 )
 
 type LoadBalancer struct {
@@ -157,8 +156,11 @@ func onDialError(src net.Conn, dstDialErr error) {
 	src.Close()
 }
 
-func reusePort(network, address string, conn syscall.RawConn) error {
-	return conn.Control(func(descriptor uintptr) {
-		syscall.SetsockoptInt(int(descriptor), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-	})
+// ResetLoadBalancer will delete the local state file for the load balacner on disk
+func ResetLoadBalancer(dataDir, serviceName string) error {
+	stateFile := filepath.Join(dataDir, "etc", serviceName+".json")
+	if err := os.Remove(stateFile); err != nil {
+		logrus.Warn(err)
+	}
+	return nil
 }

@@ -13,7 +13,10 @@ import (
 	"github.com/erikdubbelboer/gspt"
 	"github.com/pkg/errors"
 	"github.com/rancher/k3s/pkg/agent"
+	"github.com/rancher/k3s/pkg/agent/loadbalancer"
 	"github.com/rancher/k3s/pkg/cli/cmds"
+	"github.com/rancher/k3s/pkg/clientaccess"
+	"github.com/rancher/k3s/pkg/daemons/config"
 	"github.com/rancher/k3s/pkg/datadir"
 	"github.com/rancher/k3s/pkg/etcd"
 	"github.com/rancher/k3s/pkg/netutil"
@@ -36,16 +39,10 @@ import (
 )
 
 func Run(app *cli.Context) error {
-	if err := cmds.InitLogging(); err != nil {
-		return err
-	}
 	return run(app, &cmds.ServerConfig, server.CustomControllers{}, server.CustomControllers{})
 }
 
 func RunWithControllers(app *cli.Context, leaderControllers server.CustomControllers, controllers server.CustomControllers) error {
-	if err := cmds.InitLogging(); err != nil {
-		return err
-	}
 	return run(app, &cmds.ServerConfig, leaderControllers, controllers)
 }
 
@@ -57,6 +54,21 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	// hide process arguments from ps output, since they may contain
 	// database credentials or other secrets.
 	gspt.SetProcTitle(os.Args[0] + " server")
+
+	// If the agent is enabled, evacuate cgroup v2 before doing anything else that may fork.
+	// If the agent is disabled, we don't need to bother doing this as it is only the kubelet
+	// that cares about cgroups.
+	if !cfg.DisableAgent {
+		if err := cmds.EvacuateCgroup2(); err != nil {
+			return err
+		}
+	}
+
+	// Initialize logging, and subprocess reaping if necessary.
+	// Log output redirection and subprocess reaping both require forking.
+	if err := cmds.InitLogging(); err != nil {
+		return err
+	}
 
 	if !cfg.DisableAgent && os.Getuid() != 0 && !cfg.Rootless {
 		return fmt.Errorf("must run as root unless --disable-agent is specified")
@@ -77,8 +89,11 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		cfg.Token = cfg.ClusterSecret
 	}
 
+	agentReady := make(chan struct{})
+
 	serverConfig := server.Config{}
 	serverConfig.DisableAgent = cfg.DisableAgent
+	serverConfig.ControlConfig.Runtime = &config.ControlRuntime{AgentReady: agentReady}
 	serverConfig.ControlConfig.Token = cfg.Token
 	serverConfig.ControlConfig.AgentToken = cfg.AgentToken
 	serverConfig.ControlConfig.JoinURL = cfg.ServerURL
@@ -98,7 +113,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.KubeConfigOutput = cfg.KubeConfigOutput
 	serverConfig.ControlConfig.KubeConfigMode = cfg.KubeConfigMode
 	serverConfig.Rootless = cfg.Rootless
-	serverConfig.ControlConfig.SANs = knownIPs(cfg.TLSSan)
+	serverConfig.ControlConfig.SANs = cfg.TLSSan
 	serverConfig.ControlConfig.BindAddress = cfg.BindAddress
 	serverConfig.ControlConfig.SupervisorPort = cfg.SupervisorPort
 	serverConfig.ControlConfig.HTTPSPort = cfg.HTTPSPort
@@ -106,18 +121,21 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.APIServerBindAddress = cfg.APIServerBindAddress
 	serverConfig.ControlConfig.ExtraAPIArgs = cfg.ExtraAPIArgs
 	serverConfig.ControlConfig.ExtraControllerArgs = cfg.ExtraControllerArgs
+	serverConfig.ControlConfig.ExtraEtcdArgs = cfg.ExtraEtcdArgs
 	serverConfig.ControlConfig.ExtraSchedulerAPIArgs = cfg.ExtraSchedulerArgs
 	serverConfig.ControlConfig.ClusterDomain = cfg.ClusterDomain
 	serverConfig.ControlConfig.Datastore.Endpoint = cfg.DatastoreEndpoint
-	serverConfig.ControlConfig.Datastore.CAFile = cfg.DatastoreCAFile
-	serverConfig.ControlConfig.Datastore.CertFile = cfg.DatastoreCertFile
-	serverConfig.ControlConfig.Datastore.KeyFile = cfg.DatastoreKeyFile
+	serverConfig.ControlConfig.Datastore.BackendTLSConfig.CAFile = cfg.DatastoreCAFile
+	serverConfig.ControlConfig.Datastore.BackendTLSConfig.CertFile = cfg.DatastoreCertFile
+	serverConfig.ControlConfig.Datastore.BackendTLSConfig.KeyFile = cfg.DatastoreKeyFile
 	serverConfig.ControlConfig.AdvertiseIP = cfg.AdvertiseIP
 	serverConfig.ControlConfig.AdvertisePort = cfg.AdvertisePort
 	serverConfig.ControlConfig.FlannelBackend = cfg.FlannelBackend
+	serverConfig.ControlConfig.FlannelIPv6Masq = cfg.FlannelIPv6Masq
 	serverConfig.ControlConfig.ExtraCloudControllerArgs = cfg.ExtraCloudControllerArgs
 	serverConfig.ControlConfig.DisableCCM = cfg.DisableCCM
 	serverConfig.ControlConfig.DisableNPC = cfg.DisableNPC
+	serverConfig.ControlConfig.DisableHelmController = cfg.DisableHelmController
 	serverConfig.ControlConfig.DisableKubeProxy = cfg.DisableKubeProxy
 	serverConfig.ControlConfig.DisableETCD = cfg.DisableETCD
 	serverConfig.ControlConfig.DisableAPIServer = cfg.DisableAPIServer
@@ -125,34 +143,31 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.DisableControllerManager = cfg.DisableControllerManager
 	serverConfig.ControlConfig.ClusterInit = cfg.ClusterInit
 	serverConfig.ControlConfig.EncryptSecrets = cfg.EncryptSecrets
-	serverConfig.ControlConfig.EtcdSnapshotName = cfg.EtcdSnapshotName
-	serverConfig.ControlConfig.EtcdSnapshotCron = cfg.EtcdSnapshotCron
-	serverConfig.ControlConfig.EtcdSnapshotDir = cfg.EtcdSnapshotDir
-	serverConfig.ControlConfig.EtcdSnapshotRetention = cfg.EtcdSnapshotRetention
-	serverConfig.ControlConfig.EtcdDisableSnapshots = cfg.EtcdDisableSnapshots
 	serverConfig.ControlConfig.EtcdExposeMetrics = cfg.EtcdExposeMetrics
-	serverConfig.ControlConfig.EtcdS3 = cfg.EtcdS3
-	serverConfig.ControlConfig.EtcdS3Endpoint = cfg.EtcdS3Endpoint
-	serverConfig.ControlConfig.EtcdS3EndpointCA = cfg.EtcdS3EndpointCA
-	serverConfig.ControlConfig.EtcdS3SkipSSLVerify = cfg.EtcdS3SkipSSLVerify
-	serverConfig.ControlConfig.EtcdS3AccessKey = cfg.EtcdS3AccessKey
-	serverConfig.ControlConfig.EtcdS3SecretKey = cfg.EtcdS3SecretKey
-	serverConfig.ControlConfig.EtcdS3BucketName = cfg.EtcdS3BucketName
-	serverConfig.ControlConfig.EtcdS3Region = cfg.EtcdS3Region
-	serverConfig.ControlConfig.EtcdS3Folder = cfg.EtcdS3Folder
+	serverConfig.ControlConfig.EtcdDisableSnapshots = cfg.EtcdDisableSnapshots
+
+	if !cfg.EtcdDisableSnapshots {
+		serverConfig.ControlConfig.EtcdSnapshotName = cfg.EtcdSnapshotName
+		serverConfig.ControlConfig.EtcdSnapshotCron = cfg.EtcdSnapshotCron
+		serverConfig.ControlConfig.EtcdSnapshotDir = cfg.EtcdSnapshotDir
+		serverConfig.ControlConfig.EtcdSnapshotRetention = cfg.EtcdSnapshotRetention
+		serverConfig.ControlConfig.EtcdS3 = cfg.EtcdS3
+		serverConfig.ControlConfig.EtcdS3Endpoint = cfg.EtcdS3Endpoint
+		serverConfig.ControlConfig.EtcdS3EndpointCA = cfg.EtcdS3EndpointCA
+		serverConfig.ControlConfig.EtcdS3SkipSSLVerify = cfg.EtcdS3SkipSSLVerify
+		serverConfig.ControlConfig.EtcdS3AccessKey = cfg.EtcdS3AccessKey
+		serverConfig.ControlConfig.EtcdS3SecretKey = cfg.EtcdS3SecretKey
+		serverConfig.ControlConfig.EtcdS3BucketName = cfg.EtcdS3BucketName
+		serverConfig.ControlConfig.EtcdS3Region = cfg.EtcdS3Region
+		serverConfig.ControlConfig.EtcdS3Folder = cfg.EtcdS3Folder
+		serverConfig.ControlConfig.EtcdS3Insecure = cfg.EtcdS3Insecure
+		serverConfig.ControlConfig.EtcdS3Timeout = cfg.EtcdS3Timeout
+	} else {
+		logrus.Info("ETCD snapshots are disabled")
+	}
 
 	if cfg.ClusterResetRestorePath != "" && !cfg.ClusterReset {
 		return errors.New("invalid flag use; --cluster-reset required with --cluster-reset-restore-path")
-	}
-
-	// make sure components are disabled so we only perform a restore
-	// and bail out
-	if cfg.ClusterResetRestorePath != "" && cfg.ClusterReset {
-		serverConfig.ControlConfig.ClusterInit = true
-		serverConfig.ControlConfig.DisableAPIServer = true
-		serverConfig.ControlConfig.DisableControllerManager = true
-		serverConfig.ControlConfig.DisableScheduler = true
-		serverConfig.ControlConfig.DisableCCM = true
 	}
 
 	serverConfig.ControlConfig.ClusterReset = cfg.ClusterReset
@@ -191,7 +206,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		serverConfig.ControlConfig.AdvertiseIP, _ = util.GetFirst4String(cmds.AgentConfig.NodeExternalIP)
 	}
 
-	// if not set, try setting advertise-up from agent node-ip
+	// if not set, try setting advertise-ip from agent node-ip
 	if serverConfig.ControlConfig.AdvertiseIP == "" && len(cmds.AgentConfig.NodeIP) != 0 {
 		serverConfig.ControlConfig.AdvertiseIP, _ = util.GetFirst4String(cmds.AgentConfig.NodeIP)
 	}
@@ -201,6 +216,19 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	/// https://github.com/kubernetes/kubeadm/issues/1612#issuecomment-772583989
 	if serverConfig.ControlConfig.AdvertiseIP != "" {
 		serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, serverConfig.ControlConfig.AdvertiseIP)
+	}
+
+	// Ensure that we add the localhost name/ip and node name/ip to the SAN list. This list is shared by the
+	// certs for the supervisor, kube-apiserver cert, and etcd. DNS entries for the in-cluster kubernetes
+	// service endpoint are added later when the certificates are created.
+	nodeName, nodeIPs, err := util.GetHostnameAndIPs(cmds.AgentConfig.NodeName, cmds.AgentConfig.NodeIP)
+	if err != nil {
+		return err
+	}
+	serverConfig.ControlConfig.ServerNodeName = nodeName
+	serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, "127.0.0.1", "localhost", nodeName)
+	for _, ip := range nodeIPs {
+		serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, ip.String())
 	}
 
 	// configure ClusterIPRanges
@@ -357,13 +385,50 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		return errors.Wrap(err, "invalid tls-cipher-suites")
 	}
 
+	// make sure components are disabled so we only perform a restore
+	// and bail out
+	if cfg.ClusterResetRestorePath != "" && cfg.ClusterReset {
+		serverConfig.ControlConfig.ClusterInit = true
+		serverConfig.ControlConfig.DisableAPIServer = true
+		serverConfig.ControlConfig.DisableControllerManager = true
+		serverConfig.ControlConfig.DisableScheduler = true
+		serverConfig.ControlConfig.DisableCCM = true
+
+		// only close the agentReady channel in case of k3s restoration, because k3s does not start
+		// the agent until server returns successfully, unlike rke2's agent which starts in parallel
+		// with the server
+		if serverConfig.ControlConfig.SupervisorPort == serverConfig.ControlConfig.HTTPSPort {
+			close(agentReady)
+		}
+
+		dataDir, err := datadir.LocalHome(cfg.DataDir, false)
+		if err != nil {
+			return err
+		}
+		// delete local loadbalancers state for apiserver and supervisor servers
+		loadbalancer.ResetLoadBalancer(filepath.Join(dataDir, "agent"), loadbalancer.SupervisorServiceName)
+		loadbalancer.ResetLoadBalancer(filepath.Join(dataDir, "agent"), loadbalancer.APIServerServiceName)
+
+		// at this point we're doing a restore. Check to see if we've
+		// passed in a token and if not, check if the token file exists.
+		// If it doesn't, return an error indicating the token is necessary.
+		if cfg.Token == "" {
+			tokenFile := filepath.Join(dataDir, "server", "token")
+			if _, err := os.Stat(tokenFile); err != nil {
+				if os.IsNotExist(err) {
+					return errors.New(tokenFile + " does not exist, please pass --token to complete the restoration")
+				}
+			}
+		}
+	}
+
 	logrus.Info("Starting " + version.Program + " " + app.App.Version)
+
 	notifySocket := os.Getenv("NOTIFY_SOCKET")
-	os.Unsetenv("NOTIFY_SOCKET")
 
-	ctx := signals.SetupSignalHandler(context.Background())
+	ctx := signals.SetupSignalContext()
 
-	if err := server.StartServer(ctx, &serverConfig); err != nil {
+	if err := server.StartServer(ctx, &serverConfig, cfg); err != nil {
 		return err
 	}
 
@@ -375,14 +440,16 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 			<-serverConfig.ControlConfig.Runtime.ETCDReady
 			logrus.Info("ETCD server is now running")
 		}
+
 		logrus.Info(version.Program + " is up and running")
-		if notifySocket != "" {
+		if (cfg.DisableAgent || cfg.DisableAPIServer) && notifySocket != "" {
 			os.Setenv("NOTIFY_SOCKET", notifySocket)
 			systemd.SdNotify(true, "READY=1\n")
 		}
 	}()
 
 	if cfg.DisableAgent {
+		close(agentReady)
 		<-ctx.Done()
 		return nil
 	}
@@ -393,17 +460,19 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	}
 
 	url := fmt.Sprintf("https://%s:%d", ip, serverConfig.ControlConfig.SupervisorPort)
-	token, err := server.FormatToken(serverConfig.ControlConfig.Runtime.AgentToken, serverConfig.ControlConfig.Runtime.ServerCA)
+	token, err := clientaccess.FormatToken(serverConfig.ControlConfig.Runtime.AgentToken, serverConfig.ControlConfig.Runtime.ServerCA)
 	if err != nil {
 		return err
 	}
 
 	agentConfig := cmds.AgentConfig
+	agentConfig.AgentReady = agentReady
 	agentConfig.Debug = app.GlobalBool("debug")
 	agentConfig.DataDir = filepath.Dir(serverConfig.ControlConfig.DataDir)
 	agentConfig.ServerURL = url
 	agentConfig.Token = token
 	agentConfig.DisableLoadBalancer = !serverConfig.ControlConfig.DisableAPIServer
+	agentConfig.DisableServiceLB = serverConfig.DisableServiceLB
 	agentConfig.ETCDAgent = serverConfig.ControlConfig.DisableAPIServer
 	agentConfig.ClusterReset = serverConfig.ControlConfig.ClusterReset
 
@@ -441,23 +510,14 @@ func validateNetworkConfiguration(serverConfig server.Config) error {
 		return errors.Wrap(err, "failed to validate cluster-dns")
 	}
 
-	if (serverConfig.ControlConfig.FlannelBackend != "none" || serverConfig.ControlConfig.DisableNPC == false) && (dualCluster || dualService) {
-		return errors.New("flannel CNI and network policy enforcement are not compatible with dual-stack operation; server must be restarted with --flannel-backend=none --disable-network-policy and an alternative CNI plugin deployed")
+	if (serverConfig.ControlConfig.DisableNPC == false) && (dualCluster || dualService) {
+		return errors.New("network policy enforcement is not compatible with dual-stack operation; server must be restarted with --disable-network-policy")
 	}
 	if dualDNS == true {
 		return errors.New("dual-stack cluster-dns is not supported")
 	}
 
 	return nil
-}
-
-func knownIPs(ips []string) []string {
-	ips = append(ips, "127.0.0.1")
-	ip, err := utilnet.ChooseHostInterface()
-	if err == nil {
-		ips = append(ips, ip.String())
-	}
-	return ips
 }
 
 func getArgValueFromList(searchArg string, argList []string) string {

@@ -1,11 +1,14 @@
 package etcd
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -19,6 +22,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"github.com/k3s-io/kine/pkg/client"
+	endpoint2 "github.com/k3s-io/kine/pkg/endpoint"
 	"github.com/minio/minio-go/v7"
 	"github.com/pkg/errors"
 	certutil "github.com/rancher/dynamiclistener/cert"
@@ -27,12 +32,13 @@ import (
 	"github.com/rancher/k3s/pkg/daemons/control/deps"
 	"github.com/rancher/k3s/pkg/daemons/executor"
 	"github.com/rancher/k3s/pkg/version"
+	controllerv1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
 	"github.com/robfig/cron/v3"
 	"github.com/sirupsen/logrus"
-	etcd "go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/clientv3/snapshot"
-	"go.etcd.io/etcd/etcdserver/api/v3rpc/rpctypes"
-	"go.etcd.io/etcd/etcdserver/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/etcdutl/v3/snapshot"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,11 +47,11 @@ import (
 )
 
 const (
-	snapshotPrefix      = "etcd-snapshot-"
-	endpoint            = "https://127.0.0.1:2379"
-	testTimeout         = time.Second * 10
-	manageTickerTime    = time.Second * 15
-	learnerMaxStallTime = time.Minute * 5
+	endpoint             = "https://127.0.0.1:2379"
+	testTimeout          = time.Second * 10
+	manageTickerTime     = time.Second * 15
+	learnerMaxStallTime  = time.Minute * 5
+	memberRemovalTimeout = time.Minute * 1
 
 	// defaultDialTimeout is intentionally short so that connections timeout within the testTimeout defined above
 	defaultDialTimeout = 2 * time.Second
@@ -54,6 +60,10 @@ const (
 	defaultKeepAliveTimeout = 10 * time.Second
 
 	maxBackupRetention = 5
+
+	MasterLabel       = "node-role.kubernetes.io/master"
+	ControlPlaneLabel = "node-role.kubernetes.io/control-plane"
+	EtcdRoleLabel     = "node-role.kubernetes.io/etcd"
 )
 
 var (
@@ -61,17 +71,23 @@ var (
 	// AddressKey will contain the value of api addresses list
 	AddressKey = version.Program + "/apiaddresses"
 
-	snapshotConfigMapName = version.Program + "-etcd-snapshots"
+	snapshotExtraMetadataConfigMapName = version.Program + "-etcd-snapshot-extra-metadata"
+	snapshotConfigMapName              = version.Program + "-etcd-snapshots"
+
+	NodeNameAnnotation    = "etcd." + version.Program + ".cattle.io/node-name"
+	NodeAddressAnnotation = "etcd." + version.Program + ".cattle.io/node-address"
 )
 
+type NodeControllerGetter func() controllerv1.NodeController
+
 type ETCD struct {
-	client  *etcd.Client
+	client  *clientv3.Client
 	config  *config.Control
 	name    string
 	runtime *config.ControlRuntime
 	address string
 	cron    *cron.Cron
-	s3      *s3
+	s3      *S3
 }
 
 type learnerProgress struct {
@@ -139,19 +155,23 @@ func (e *ETCD) Test(ctx context.Context) error {
 	return errors.Errorf("this server is a not a member of the etcd cluster. Found %v, expect: %s=%s", memberNameUrls, e.name, e.address)
 }
 
-// etcdDBDir returns the path to dataDir/db/etcd
-func etcdDBDir(config *config.Control) string {
+// DBDir returns the path to dataDir/db/etcd
+func DBDir(config *config.Control) string {
 	return filepath.Join(config.DataDir, "db", "etcd")
 }
 
 // walDir returns the path to etcdDBDir/member/wal
 func walDir(config *config.Control) string {
-	return filepath.Join(etcdDBDir(config), "member", "wal")
+	return filepath.Join(DBDir(config), "member", "wal")
+}
+
+func sqliteFile(config *config.Control) string {
+	return filepath.Join(config.DataDir, "db", "state.db")
 }
 
 // nameFile returns the path to etcdDBDir/name.
 func nameFile(config *config.Control) string {
-	return filepath.Join(etcdDBDir(config), "name")
+	return filepath.Join(DBDir(config), "name")
 }
 
 // ResetFile returns the path to etcdDBDir/reset-flag.
@@ -168,26 +188,34 @@ func (e *ETCD) IsInitialized(ctx context.Context, config *config.Control) (bool,
 	} else if os.IsNotExist(err) {
 		return false, nil
 	} else {
-		return false, errors.Wrapf(err, "invalid state for wal directory %s", dir)
+		return false, errors.Wrap(err, "invalid state for wal directory "+dir)
 	}
 }
 
-// Reset resets an etcd node
+// Reset resets an etcd node to a single node cluster.
 func (e *ETCD) Reset(ctx context.Context, rebootstrap func() error) error {
 	// Wait for etcd to come up as a new single-node cluster, then exit
 	go func() {
+		<-e.runtime.AgentReady
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for range t.C {
+			// resetting the apiaddresses to nil since we are doing a restoration
+			if _, err := e.client.Put(ctx, AddressKey, ""); err != nil {
+				logrus.Warnf("failed to reset api addresses key in etcd: %v", err)
+				continue
+			}
 			if err := e.Test(ctx); err == nil {
 				members, err := e.client.MemberList(ctx)
 				if err != nil {
 					continue
 				}
 
-				// storageBootstrap() - runtime structure has been written with correct certificate data
-				if err := rebootstrap(); err != nil {
-					logrus.Fatal(err)
+				if rebootstrap != nil {
+					// storageBootstrap() - runtime structure has been written with correct certificate data
+					if err := rebootstrap(); err != nil {
+						logrus.Fatal(err)
+					}
 				}
 
 				// call functions to rewrite them from daemons/control/server.go (prepare())
@@ -199,7 +227,23 @@ func (e *ETCD) Reset(ctx context.Context, rebootstrap func() error) error {
 					logrus.Infof("Etcd is running, restart without --cluster-reset flag now. Backup and delete ${datadir}/server/db on each peer etcd server and rejoin the nodes")
 					os.Exit(0)
 				}
+			} else {
+				// make sure that peer ips are updated to the node ip in case the test fails
+				members, err := e.client.MemberList(ctx)
+				if err != nil {
+					logrus.Warnf("failed to list etcd members: %v", err)
+					continue
+				}
+				if len(members.Members) > 1 {
+					logrus.Warnf("failed to update peer url: etcd still has more than one member")
+					continue
+				}
+				if _, err := e.client.MemberUpdate(ctx, members.Members[0].ID, []string{e.peerURL()}); err != nil {
+					logrus.Warnf("failed to update peer url: %v", err)
+					continue
+				}
 			}
+
 		}
 	}()
 
@@ -210,7 +254,7 @@ func (e *ETCD) Reset(ctx context.Context, rebootstrap func() error) error {
 				return err
 			}
 			logrus.Infof("Retrieving etcd snapshot %s from S3", e.config.ClusterResetRestorePath)
-			if err := e.s3.download(ctx); err != nil {
+			if err := e.s3.Download(ctx); err != nil {
 				return err
 			}
 			logrus.Infof("S3 download complete for %s", e.config.ClusterResetRestorePath)
@@ -254,7 +298,7 @@ func (e *ETCD) Start(ctx context.Context, clientAccessInfo *clientaccess.Info) e
 
 	if existingCluster {
 		//check etcd dir permission
-		etcdDir := etcdDBDir(e.config)
+		etcdDir := DBDir(e.config)
 		info, err := os.Stat(etcdDir)
 		if err != nil {
 			return err
@@ -275,24 +319,19 @@ func (e *ETCD) Start(ctx context.Context, clientAccessInfo *clientaccess.Info) e
 		return e.newCluster(ctx, false)
 	}
 
-	err = e.join(ctx, clientAccessInfo)
-	return errors.Wrap(err, "joining etcd cluster")
+	go func() {
+		<-e.runtime.AgentReady
+		if err := e.join(ctx, clientAccessInfo); err != nil {
+			logrus.Fatalf("ETCD join failed: %v", err)
+		}
+	}()
+
+	return nil
 }
 
 // join attempts to add a member to an existing cluster
 func (e *ETCD) join(ctx context.Context, clientAccessInfo *clientaccess.Info) error {
-	clientURLs, memberList, err := ClientURLs(ctx, clientAccessInfo, e.config.PrivateIP)
-	if err != nil {
-		return err
-	}
-
-	client, err := GetClient(ctx, e.runtime, clientURLs...)
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	clientCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	var (
@@ -300,10 +339,21 @@ func (e *ETCD) join(ctx context.Context, clientAccessInfo *clientaccess.Info) er
 		add     = true
 	)
 
-	members, err := client.MemberList(ctx)
+	clientURLs, memberList, err := ClientURLs(clientCtx, clientAccessInfo, e.config.PrivateIP)
+	if err != nil {
+		return err
+	}
+
+	client, err := GetClient(clientCtx, e.runtime, clientURLs...)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	members, err := client.MemberList(clientCtx)
 	if err != nil {
 		logrus.Errorf("Failed to get member list from etcd cluster. Will assume this member is already added")
-		members = &etcd.MemberListResponse{
+		members = &clientv3.MemberListResponse{
 			Members: append(memberList.Members, &etcdserverpb.Member{
 				Name:     e.name,
 				PeerURLs: []string{e.peerURL()},
@@ -318,22 +368,43 @@ func (e *ETCD) join(ctx context.Context, clientAccessInfo *clientaccess.Info) er
 			if err != nil {
 				return err
 			}
-			// An uninitialized member won't have a name
-			if u.Hostname() == e.address && (member.Name == e.name || member.Name == "") {
-				add = false
-			}
+			// An uninitialized joining member won't have a name; if it has our
+			// address it must be us.
 			if member.Name == "" && u.Hostname() == e.address {
 				member.Name = e.name
 			}
+
+			// If we're already in the cluster, don't try to add ourselves.
+			if member.Name == e.name && u.Hostname() == e.address {
+				add = false
+			}
+
 			if len(member.PeerURLs) > 0 {
 				cluster = append(cluster, fmt.Sprintf("%s=%s", member.Name, member.PeerURLs[0]))
 			}
 		}
+
+		// Try to get the node name from the member name
+		memberNodeName := member.Name
+		if lastHyphen := strings.LastIndex(member.Name, "-"); lastHyphen > 1 {
+			memberNodeName = member.Name[:lastHyphen]
+		}
+
+		// Make sure there's not already a member in the cluster with a duplicate node name
+		if member.Name != e.name && memberNodeName == e.config.ServerNodeName {
+			// make sure to remove the name file if a duplicate node name is used, so that we
+			// generate a new member name when our node name is fixed.
+			nameFile := nameFile(e.config)
+			if err := os.Remove(nameFile); err != nil {
+				logrus.Errorf("Failed to remove etcd name file %s: %v", nameFile, err)
+			}
+			return errors.New("duplicate node name found, please use a unique name for this node")
+		}
 	}
 
 	if add {
-		logrus.Infof("Adding %s to etcd cluster %v", e.peerURL(), cluster)
-		if _, err = client.MemberAddAsLearner(ctx, []string{e.peerURL()}); err != nil {
+		logrus.Infof("Adding member %s=%s to etcd cluster %v", e.name, e.peerURL(), cluster)
+		if _, err = client.MemberAddAsLearner(clientCtx, []string{e.peerURL()}); err != nil {
 			return err
 		}
 		cluster = append(cluster, fmt.Sprintf("%s=%s", e.name, e.peerURL()))
@@ -363,25 +434,31 @@ func (e *ETCD) Register(ctx context.Context, config *config.Control, handler htt
 	}
 	e.address = address
 	e.config.Datastore.Endpoint = endpoint
-	e.config.Datastore.Config.CAFile = e.runtime.ETCDServerCA
-	e.config.Datastore.Config.CertFile = e.runtime.ClientETCDCert
-	e.config.Datastore.Config.KeyFile = e.runtime.ClientETCDKey
+	e.config.Datastore.BackendTLSConfig.CAFile = e.runtime.ETCDServerCA
+	e.config.Datastore.BackendTLSConfig.CertFile = e.runtime.ClientETCDCert
+	e.config.Datastore.BackendTLSConfig.KeyFile = e.runtime.ClientETCDKey
+
+	tombstoneFile := filepath.Join(DBDir(e.config), "tombstone")
+	if _, err := os.Stat(tombstoneFile); err == nil {
+		logrus.Infof("tombstone file has been detected, removing data dir to rejoin the cluster")
+		if _, err := backupDirWithRetention(DBDir(e.config), maxBackupRetention); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := e.setName(false); err != nil {
 		return nil, err
 	}
 	e.config.Runtime.ClusterControllerStart = func(ctx context.Context) error {
-		Register(ctx, e, e.config.Runtime.Core.Core().V1().Node())
+		RegisterMetadataHandlers(ctx, e, e.config.Runtime.Core.Core().V1().Node())
 		return nil
 	}
 
-	tombstoneFile := filepath.Join(etcdDBDir(e.config), "tombstone")
-	if _, err := os.Stat(tombstoneFile); err == nil {
-		logrus.Infof("tombstone file has been detected, removing data dir to rejoin the cluster")
-		if _, err := backupDirWithRetention(etcdDBDir(e.config), maxBackupRetention); err != nil {
-			return nil, err
-		}
+	e.config.Runtime.LeaderElectedClusterControllerStart = func(ctx context.Context) error {
+		RegisterMemberHandlers(ctx, e, e.config.Runtime.Core.Core().V1().Node())
+		return nil
 	}
+
 	return e.handler(handler), err
 }
 
@@ -392,11 +469,7 @@ func (e *ETCD) setName(force bool) error {
 	fileName := nameFile(e.config)
 	data, err := ioutil.ReadFile(fileName)
 	if os.IsNotExist(err) || force {
-		h, err := os.Hostname()
-		if err != nil {
-			return err
-		}
-		e.name = strings.SplitN(h, ".", 2)[0] + "-" + uuid.New().String()[:8]
+		e.name = e.config.ServerNodeName + "-" + uuid.New().String()[:8]
 		if err := os.MkdirAll(filepath.Dir(fileName), 0700); err != nil {
 			return err
 		}
@@ -416,7 +489,7 @@ func (e *ETCD) handler(next http.Handler) http.Handler {
 	return mux
 }
 
-// infoHandler returns etcd cluster information. This is used by new members when joining the custer.
+// infoHandler returns etcd cluster information. This is used by new members when joining the cluster.
 func (e *ETCD) infoHandler() http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
@@ -443,35 +516,39 @@ func (e *ETCD) infoHandler() http.Handler {
 	})
 }
 
-// getClient returns an etcd client connected to the specified endpoints
-func GetClient(ctx context.Context, runtime *config.ControlRuntime, endpoints ...string) (*etcd.Client, error) {
+// GetClient returns an etcd client connected to the specified endpoints
+func GetClient(ctx context.Context, runtime *config.ControlRuntime, endpoints ...string) (*clientv3.Client, error) {
 	cfg, err := getClientConfig(ctx, runtime, endpoints...)
 	if err != nil {
 		return nil, err
 	}
-	return etcd.New(*cfg)
+
+	return clientv3.New(*cfg)
 }
 
-//getClientConfig generates an etcd client config connected to the specified endpoints
-func getClientConfig(ctx context.Context, runtime *config.ControlRuntime, endpoints ...string) (*etcd.Config, error) {
+// getClientConfig generates an etcd client config connected to the specified endpoints
+func getClientConfig(ctx context.Context, runtime *config.ControlRuntime, endpoints ...string) (*clientv3.Config, error) {
 	tlsConfig, err := toTLSConfig(runtime)
 	if err != nil {
 		return nil, err
 	}
-	cfg := &etcd.Config{
+	return &clientv3.Config{
 		Endpoints:            endpoints,
 		TLS:                  tlsConfig,
 		Context:              ctx,
 		DialTimeout:          defaultDialTimeout,
 		DialKeepAliveTime:    defaultKeepAliveTime,
 		DialKeepAliveTimeout: defaultKeepAliveTimeout,
-	}
-	return cfg, nil
+	}, nil
 }
 
 // toTLSConfig converts the ControlRuntime configuration to TLS configuration suitable
 // for use by etcd.
 func toTLSConfig(runtime *config.ControlRuntime) (*tls.Config, error) {
+	if runtime.ClientETCDCert == "" || runtime.ClientETCDKey == "" || runtime.ETCDServerCA == "" {
+		return nil, errors.New("runtime is not ready yet")
+	}
+
 	clientCert, err := tls.LoadX509KeyPair(runtime.ClientETCDCert, runtime.ClientETCDKey)
 	if err != nil {
 		return nil, err
@@ -504,11 +581,68 @@ func GetAdvertiseAddress(advertiseIP string) (string, error) {
 
 // newCluster returns options to set up etcd for a new cluster
 func (e *ETCD) newCluster(ctx context.Context, reset bool) error {
-	return e.cluster(ctx, reset, executor.InitialOptions{
-		AdvertisePeerURL: fmt.Sprintf("https://%s:2380", e.address),
-		Cluster:          fmt.Sprintf("%s=https://%s:2380", e.name, e.address),
+	err := e.cluster(ctx, reset, executor.InitialOptions{
+		AdvertisePeerURL: e.peerURL(),
+		Cluster:          fmt.Sprintf("%s=%s", e.name, e.peerURL()),
 		State:            "new",
 	})
+	if err != nil {
+		return err
+	}
+	if err := e.migrateFromSQLite(ctx); err != nil {
+		return fmt.Errorf("failed to migrate content from sqlite to etcd: %w", err)
+	}
+	return nil
+}
+
+func (e *ETCD) migrateFromSQLite(ctx context.Context) error {
+	_, err := os.Stat(sqliteFile(e.config))
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	logrus.Infof("Migrating content from sqlite to etcd")
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	_, err = endpoint2.Listen(ctx, endpoint2.Config{
+		Endpoint: endpoint2.SQLiteBackend,
+	})
+	if err != nil {
+		return err
+	}
+
+	sqliteClient, err := client.New(endpoint2.ETCDConfig{
+		Endpoints: []string{"unix://kine.sock"},
+	})
+	if err != nil {
+		return err
+	}
+	defer sqliteClient.Close()
+
+	etcdClient, err := GetClient(ctx, e.runtime, "https://localhost:2379")
+	if err != nil {
+		return err
+	}
+	defer etcdClient.Close()
+
+	values, err := sqliteClient.List(ctx, "/registry/", 0)
+	if err != nil {
+		return err
+	}
+
+	for _, value := range values {
+		logrus.Infof("Migrating etcd key %s", value.Key)
+		_, err := etcdClient.Put(ctx, string(value.Key), string(value.Data))
+		if err != nil {
+			return err
+		}
+	}
+
+	return os.Rename(sqliteFile(e.config), sqliteFile(e.config)+".migrated")
 }
 
 // peerURL returns the peer access address for the local node
@@ -523,23 +657,24 @@ func (e *ETCD) clientURL() string {
 
 // metricsURL returns the metrics access address
 func (e *ETCD) metricsURL(expose bool) string {
+	address := "http://127.0.0.1:2381"
 	if expose {
-		return fmt.Sprintf("http://%s:2381", e.address)
+		address = fmt.Sprintf("http://%s:2381,%s", e.address, address)
 	}
-	return "http://127.0.0.1:2381"
+	return address
 }
 
 // cluster returns ETCDConfig for a cluster
 func (e *ETCD) cluster(ctx context.Context, forceNew bool, options executor.InitialOptions) error {
-	return executor.ETCD(executor.ETCDConfig{
+	return executor.ETCD(ctx, executor.ETCDConfig{
 		Name:                e.name,
 		InitialOptions:      options,
 		ForceNewCluster:     forceNew,
-		ListenClientURLs:    fmt.Sprintf(e.clientURL() + ",https://127.0.0.1:2379"),
+		ListenClientURLs:    e.clientURL() + ",https://127.0.0.1:2379",
 		ListenMetricsURLs:   e.metricsURL(e.config.EtcdExposeMetrics),
 		ListenPeerURLs:      e.peerURL(),
 		AdvertiseClientURLs: e.clientURL(),
-		DataDir:             etcdDBDir(e.config),
+		DataDir:             DBDir(e.config),
 		ServerTrust: executor.ServerTrust{
 			CertFile:       e.config.Runtime.ServerETCDCert,
 			KeyFile:        e.config.Runtime.ServerETCDKey,
@@ -556,18 +691,20 @@ func (e *ETCD) cluster(ctx context.Context, forceNew bool, options executor.Init
 		HeartbeatInterval: 500,
 		Logger:            "zap",
 		LogOutputs:        []string{"stderr"},
-	})
+	}, e.config.ExtraEtcdArgs)
 }
 
-// removePeer removes a peer from the cluster. The peer ID and IP address must both match.
-func (e *ETCD) removePeer(ctx context.Context, id, address string, removeSelf bool) error {
+// RemovePeer removes a peer from the cluster. The peer name and IP address must both match.
+func (e *ETCD) RemovePeer(ctx context.Context, name, address string, allowSelfRemoval bool) error {
+	ctx, cancel := context.WithTimeout(ctx, memberRemovalTimeout)
+	defer cancel()
 	members, err := e.client.MemberList(ctx)
 	if err != nil {
 		return err
 	}
 
 	for _, member := range members.Members {
-		if member.Name != id {
+		if member.Name != name {
 			continue
 		}
 		for _, peerURL := range member.PeerURLs {
@@ -576,8 +713,8 @@ func (e *ETCD) removePeer(ctx context.Context, id, address string, removeSelf bo
 				return err
 			}
 			if u.Hostname() == address {
-				if e.address == address && !removeSelf {
-					return errors.New("node has been deleted from the cluster")
+				if e.address == address && !allowSelfRemoval {
+					return errors.New("not removing self from etcd cluster")
 				}
 				logrus.Infof("Removing name=%s id=%d address=%s from etcd", member.Name, member.ID, address)
 				_, err := e.client.MemberRemove(ctx, member.ID)
@@ -596,6 +733,7 @@ func (e *ETCD) removePeer(ctx context.Context, id, address string, removeSelf bo
 // being promoted to full voting member. The checks only run on the cluster member that is
 // the etcd leader.
 func (e *ETCD) manageLearners(ctx context.Context) error {
+	<-e.runtime.AgentReady
 	t := time.NewTicker(manageTickerTime)
 	defer t.Stop()
 
@@ -604,6 +742,10 @@ func (e *ETCD) manageLearners(ctx context.Context) error {
 		defer cancel()
 
 		// Check to see if the local node is the leader. Only the leader should do learner management.
+		if e.client == nil {
+			logrus.Error("Etcd client was nil")
+			continue
+		}
 		if status, err := e.client.Status(ctx, endpoint); err != nil {
 			logrus.Errorf("Failed to check local etcd status for learner management: %v", err)
 			continue
@@ -744,8 +886,12 @@ members:
 		if member.IsLearner {
 			continue
 		}
-		for _, url := range member.ClientURLs {
-			if strings.Contains(url, ip) {
+		for _, clientURL := range member.ClientURLs {
+			u, err := url.Parse(clientURL)
+			if err != nil {
+				continue
+			}
+			if u.Hostname() == ip {
 				continue members
 			}
 		}
@@ -755,14 +901,14 @@ members:
 }
 
 // snapshotDir ensures that the snapshot directory exists, and then returns its path.
-func snapshotDir(config *config.Control) (string, error) {
+func snapshotDir(config *config.Control, create bool) (string, error) {
 	if config.EtcdSnapshotDir == "" {
 		// we have to create the snapshot dir if we are using
 		// the default snapshot dir if it doesn't exist
 		defaultSnapshotDir := filepath.Join(config.DataDir, "db", "snapshots")
 		s, err := os.Stat(defaultSnapshotDir)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if create && os.IsNotExist(err) {
 				if err := os.MkdirAll(defaultSnapshotDir, 0700); err != nil {
 					return "", err
 				}
@@ -797,12 +943,115 @@ func (e *ETCD) preSnapshotSetup(ctx context.Context, config *config.Control) err
 	return nil
 }
 
-// Snapshot attempts to save a new snapshot to the configured directory, and then clean up any old
+const compressedExtension = ".zip"
+
+// compressSnapshot compresses the given snapshot and provides the
+// caller with the path to the file.
+func (e *ETCD) compressSnapshot(snapshotDir, snapshotName, snapshotPath string) (string, error) {
+	logrus.Info("Compressing etcd snapshot file: " + snapshotName)
+
+	zippedSnapshotName := snapshotName + compressedExtension
+	zipPath := filepath.Join(snapshotDir, zippedSnapshotName)
+
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		return "", err
+	}
+	defer zf.Close()
+
+	zipWriter := zip.NewWriter(zf)
+	defer zipWriter.Close()
+
+	uncompressedPath := filepath.Join(snapshotDir, snapshotName)
+	fileToZip, err := os.Open(uncompressedPath)
+	if err != nil {
+		os.Remove(zipPath)
+		return "", err
+	}
+	defer fileToZip.Close()
+
+	info, err := fileToZip.Stat()
+	if err != nil {
+		os.Remove(zipPath)
+		return "", err
+	}
+
+	header, err := zip.FileInfoHeader(info)
+	if err != nil {
+		os.Remove(zipPath)
+		return "", err
+	}
+
+	header.Name = snapshotName
+	header.Method = zip.Deflate
+	header.Modified = time.Now()
+
+	writer, err := zipWriter.CreateHeader(header)
+	if err != nil {
+		os.Remove(zipPath)
+		return "", err
+	}
+	_, err = io.Copy(writer, fileToZip)
+
+	return zipPath, err
+}
+
+// decompressSnapshot decompresses the given snapshot and provides the caller
+// with the full path to the uncompressed snapshot.
+func (e *ETCD) decompressSnapshot(snapshotDir, snapshotFile string) (string, error) {
+	logrus.Info("Decompressing etcd snapshot file: " + snapshotFile)
+
+	r, err := zip.OpenReader(snapshotFile)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+
+	var decompressed *os.File
+	for _, sf := range r.File {
+		decompressed, err = os.OpenFile(strings.Replace(sf.Name, compressedExtension, "", -1), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, sf.Mode())
+		if err != nil {
+			return "", err
+		}
+		defer decompressed.Close()
+
+		ss, err := sf.Open()
+		if err != nil {
+			return "", err
+		}
+		defer ss.Close()
+
+		if _, err := io.Copy(decompressed, ss); err != nil {
+			os.Remove("")
+			return "", err
+		}
+	}
+
+	return decompressed.Name(), nil
+}
+
+// Snapshot attempts to save a new snapshot to the configured directory, and then clean up any old and failed
 // snapshots in excess of the retention limits. This method is used in the internal cron snapshot
 // system as well as used to do on-demand snapshots.
 func (e *ETCD) Snapshot(ctx context.Context, config *config.Control) error {
 	if err := e.preSnapshotSetup(ctx, config); err != nil {
 		return err
+	}
+
+	logrus.Debugf("Attempting to retrieve extra metadata from %s ConfigMap", snapshotExtraMetadataConfigMapName)
+	var extraMetadata string
+	if snapshotExtraMetadataConfigMap, err := e.config.Runtime.Core.Core().V1().ConfigMap().Get(metav1.NamespaceSystem, snapshotExtraMetadataConfigMapName, metav1.GetOptions{}); err != nil {
+		logrus.Debugf("Error encountered attempting to retrieve extra metadata from %s ConfigMap, error: %v", snapshotExtraMetadataConfigMapName, err)
+		extraMetadata = ""
+	} else {
+		if m, err := json.Marshal(snapshotExtraMetadataConfigMap.Data); err != nil {
+			logrus.Debugf("Error attempting to marshal extra metadata contained in %s ConfigMap, error: %v", snapshotExtraMetadataConfigMapName, err)
+			extraMetadata = ""
+		} else {
+			logrus.Debugf("Setting extra metadata from %s ConfigMap", snapshotExtraMetadataConfigMapName)
+			logrus.Tracef("Marshalled extra metadata in %s ConfigMap was: %s", snapshotExtraMetadataConfigMapName, string(m))
+			extraMetadata = base64.StdEncoding.EncodeToString(m)
+		}
 	}
 
 	status, err := e.client.Status(ctx, endpoint)
@@ -811,11 +1060,11 @@ func (e *ETCD) Snapshot(ctx context.Context, config *config.Control) error {
 	}
 
 	if status.IsLearner {
-		logrus.Warnf("Skipping snapshot: not supported for learner")
+		logrus.Warnf("Unable to take snapshot: not supported for learner")
 		return nil
 	}
 
-	snapshotDir, err := snapshotDir(e.config)
+	snapshotDir, err := snapshotDir(e.config, true)
 	if err != nil {
 		return errors.Wrap(err, "failed to get the snapshot dir")
 	}
@@ -826,40 +1075,118 @@ func (e *ETCD) Snapshot(ctx context.Context, config *config.Control) error {
 	}
 
 	nodeName := os.Getenv("NODE_NAME")
-	snapshotName := fmt.Sprintf("%s-%s-%d", e.config.EtcdSnapshotName, nodeName, time.Now().Unix())
+	now := time.Now()
+	snapshotName := fmt.Sprintf("%s-%s-%d", e.config.EtcdSnapshotName, nodeName, now.Unix())
 	snapshotPath := filepath.Join(snapshotDir, snapshotName)
 
 	logrus.Infof("Saving etcd snapshot to %s", snapshotPath)
 
+	var sf *snapshotFile
+
 	if err := snapshot.NewV3(nil).Save(ctx, *cfg, snapshotPath); err != nil {
-		return errors.Wrap(err, "failed to save snapshot")
+		sf = &snapshotFile{
+			Name:     snapshotName,
+			Location: "",
+			Metadata: extraMetadata,
+			NodeName: nodeName,
+			CreatedAt: &metav1.Time{
+				Time: now,
+			},
+			Status:     failedSnapshotStatus,
+			Message:    base64.StdEncoding.EncodeToString([]byte(err.Error())),
+			Size:       0,
+			Compressed: e.config.EtcdSnapshotCompress,
+		}
+		logrus.Errorf("Failed to take etcd snapshot: %v", err)
+		if err := e.addSnapshotData(*sf); err != nil {
+			return errors.Wrap(err, "failed to save local snapshot failure data to configmap")
+		}
 	}
 
-	if e.config.EtcdS3 {
-		logrus.Infof("Saving etcd snapshot %s to S3", snapshotName)
-		if err := e.initS3IfNil(ctx); err != nil {
+	if e.config.EtcdSnapshotCompress {
+		zipPath, err := e.compressSnapshot(snapshotDir, snapshotName, snapshotPath)
+		if err != nil {
 			return err
 		}
-		if err := e.s3.upload(ctx, snapshotPath); err != nil {
+		if err := os.Remove(snapshotPath); err != nil {
 			return err
 		}
-		logrus.Infof("S3 upload complete for %s", snapshotName)
+		snapshotPath = zipPath
+		logrus.Info("Compressed snapshot: " + snapshotPath)
+	}
 
-		if e.config.EtcdSnapshotRetention >= 1 {
-			if err := e.s3.snapshotRetention(ctx); err != nil {
-				return errors.Wrap(err, "failed to apply s3 snapshot retention")
+	// If the snapshot attempt was successful, sf will be nil as we did not set it.
+	if sf == nil {
+		f, err := os.Stat(snapshotPath)
+		if err != nil {
+			return errors.Wrap(err, "unable to retrieve snapshot information from local snapshot")
+		}
+		sf = &snapshotFile{
+			Name:     f.Name(),
+			Metadata: extraMetadata,
+			Location: "file://" + snapshotPath,
+			NodeName: nodeName,
+			CreatedAt: &metav1.Time{
+				Time: f.ModTime(),
+			},
+			Status:     successfulSnapshotStatus,
+			Size:       f.Size(),
+			Compressed: e.config.EtcdSnapshotCompress,
+		}
+
+		if err := e.addSnapshotData(*sf); err != nil {
+			return errors.Wrap(err, "failed to save local snapshot data to configmap")
+		}
+
+		if err := snapshotRetention(e.config.EtcdSnapshotRetention, e.config.EtcdSnapshotName, snapshotDir); err != nil {
+			return errors.Wrap(err, "failed to apply local snapshot retention policy")
+		}
+
+		if e.config.EtcdS3 {
+			logrus.Infof("Saving etcd snapshot %s to S3", snapshotName)
+			// Set sf to nil so that we can attempt to now upload the snapshot to S3 if needed
+			sf = nil
+			if err := e.initS3IfNil(ctx); err != nil {
+				logrus.Warnf("Unable to initialize S3 client: %v", err)
+				sf = &snapshotFile{
+					Name:     filepath.Base(snapshotPath),
+					Metadata: extraMetadata,
+					NodeName: "s3",
+					CreatedAt: &metav1.Time{
+						Time: now,
+					},
+					Message: base64.StdEncoding.EncodeToString([]byte(err.Error())),
+					Size:    0,
+					Status:  failedSnapshotStatus,
+					S3: &s3Config{
+						Endpoint:      e.config.EtcdS3Endpoint,
+						EndpointCA:    e.config.EtcdS3EndpointCA,
+						SkipSSLVerify: e.config.EtcdS3SkipSSLVerify,
+						Bucket:        e.config.EtcdS3BucketName,
+						Region:        e.config.EtcdS3Region,
+						Folder:        e.config.EtcdS3Folder,
+						Insecure:      e.config.EtcdS3Insecure,
+					},
+				}
+			}
+			// sf should be nil if we were able to successfully initialize the S3 client.
+			if sf == nil {
+				sf, err = e.s3.upload(ctx, snapshotPath, extraMetadata, now)
+				if err != nil {
+					return err
+				}
+				logrus.Infof("S3 upload complete for %s", snapshotName)
+				if err := e.s3.snapshotRetention(ctx); err != nil {
+					return errors.Wrap(err, "failed to apply s3 snapshot retention policy")
+				}
+			}
+			if err := e.addSnapshotData(*sf); err != nil {
+				return errors.Wrap(err, "failed to save snapshot data to configmap")
 			}
 		}
 	}
 
-	// check if we need to perform a retention check
-	if e.config.EtcdSnapshotRetention >= 1 {
-		if err := snapshotRetention(e.config.EtcdSnapshotRetention, snapshotDir); err != nil {
-			return errors.Wrap(err, "failed to apply snapshot retention")
-		}
-	}
-
-	return e.StoreSnapshotData(ctx)
+	return e.ReconcileSnapshotData(ctx)
 }
 
 type s3Config struct {
@@ -869,26 +1196,73 @@ type s3Config struct {
 	Bucket        string `json:"bucket,omitempty"`
 	Region        string `json:"region,omitempty"`
 	Folder        string `json:"folder,omitempty"`
+	Insecure      bool   `json:"insecure,omitempty"`
 }
 
-// SnapshotFile represents a single snapshot and it's
+type snapshotStatus string
+
+const (
+	successfulSnapshotStatus snapshotStatus = "successful"
+	failedSnapshotStatus     snapshotStatus = "failed"
+)
+
+// snapshotFile represents a single snapshot and it's
 // metadata.
-type SnapshotFile struct {
+type snapshotFile struct {
 	Name string `json:"name"`
 	// Location contains the full path of the snapshot. For
 	// local paths, the location will be prefixed with "file://".
-	Location  string       `json:"location,omitempty"`
-	NodeName  string       `json:"nodeName,omitempty"`
-	CreatedAt *metav1.Time `json:"createdAt,omitempty"`
-	Size      int64        `json:"size,omitempty"`
-	S3        *s3Config    `json:"s3Config,omitempty"`
+	Location   string         `json:"location,omitempty"`
+	Metadata   string         `json:"metadata,omitempty"`
+	Message    string         `json:"message,omitempty"`
+	NodeName   string         `json:"nodeName,omitempty"`
+	CreatedAt  *metav1.Time   `json:"createdAt,omitempty"`
+	Size       int64          `json:"size,omitempty"`
+	Status     snapshotStatus `json:"status,omitempty"`
+	S3         *s3Config      `json:"s3Config,omitempty"`
+	Compressed bool           `json:"compressed"`
 }
 
-// listSnapshots provides a list of the currently stored
-// snapshots on disk or in S3 along with their relevant
+// listLocalSnapshots provides a list of the currently stored
+// snapshots on disk along with their relevant
 // metadata.
-func (e *ETCD) listSnapshots(ctx context.Context, snapshotDir string) ([]SnapshotFile, error) {
-	var snapshots []SnapshotFile
+func (e *ETCD) listLocalSnapshots() (map[string]snapshotFile, error) {
+	snapshots := make(map[string]snapshotFile)
+	snapshotDir, err := snapshotDir(e.config, true)
+	if err != nil {
+		return snapshots, errors.Wrap(err, "failed to get the snapshot dir")
+	}
+
+	files, err := ioutil.ReadDir(snapshotDir)
+	if err != nil {
+		return nil, err
+	}
+
+	nodeName := os.Getenv("NODE_NAME")
+
+	for _, f := range files {
+		sf := snapshotFile{
+			Name:     f.Name(),
+			Location: "file://" + filepath.Join(snapshotDir, f.Name()),
+			NodeName: nodeName,
+			CreatedAt: &metav1.Time{
+				Time: f.ModTime(),
+			},
+			Size:   f.Size(),
+			Status: successfulSnapshotStatus,
+		}
+		sfKey := generateSnapshotConfigMapKey(sf)
+		snapshots[sfKey] = sf
+	}
+
+	return snapshots, nil
+}
+
+// listS3Snapshots provides a list of currently stored
+// snapshots in S3 along with their relevant
+// metadata.
+func (e *ETCD) listS3Snapshots(ctx context.Context) (map[string]snapshotFile, error) {
+	snapshots := make(map[string]snapshotFile)
 
 	if e.config.EtcdS3 {
 		ctx, cancel := context.WithCancel(ctx)
@@ -898,7 +1272,15 @@ func (e *ETCD) listSnapshots(ctx context.Context, snapshotDir string) ([]Snapsho
 			return nil, err
 		}
 
-		objects := e.s3.client.ListObjects(ctx, e.config.EtcdS3BucketName, minio.ListObjectsOptions{})
+		var loo minio.ListObjectsOptions
+		if e.config.EtcdS3Folder != "" {
+			loo = minio.ListObjectsOptions{
+				Prefix:    e.config.EtcdS3Folder,
+				Recursive: true,
+			}
+		}
+
+		objects := e.s3.client.ListObjects(ctx, e.config.EtcdS3BucketName, loo)
 
 		for obj := range objects {
 			if obj.Err != nil {
@@ -913,7 +1295,7 @@ func (e *ETCD) listSnapshots(ctx context.Context, snapshotDir string) ([]Snapsho
 				return nil, err
 			}
 
-			snapshots = append(snapshots, SnapshotFile{
+			sf := snapshotFile{
 				Name:     filepath.Base(obj.Key),
 				NodeName: "s3",
 				CreatedAt: &metav1.Time{
@@ -927,32 +1309,14 @@ func (e *ETCD) listSnapshots(ctx context.Context, snapshotDir string) ([]Snapsho
 					Bucket:        e.config.EtcdS3BucketName,
 					Region:        e.config.EtcdS3Region,
 					Folder:        e.config.EtcdS3Folder,
+					Insecure:      e.config.EtcdS3Insecure,
 				},
-			})
+				Status: successfulSnapshotStatus,
+			}
+			sfKey := generateSnapshotConfigMapKey(sf)
+			snapshots[sfKey] = sf
 		}
-
-		return snapshots, nil
 	}
-
-	files, err := ioutil.ReadDir(snapshotDir)
-	if err != nil {
-		return nil, err
-	}
-
-	nodeName := os.Getenv("NODE_NAME")
-
-	for _, f := range files {
-		snapshots = append(snapshots, SnapshotFile{
-			Name:     f.Name(),
-			Location: "file://" + filepath.Join(snapshotDir, f.Name()),
-			NodeName: nodeName,
-			CreatedAt: &metav1.Time{
-				Time: f.ModTime(),
-			},
-			Size: f.Size(),
-		})
-	}
-
 	return snapshots, nil
 }
 
@@ -960,7 +1324,7 @@ func (e *ETCD) listSnapshots(ctx context.Context, snapshotDir string) ([]Snapsho
 // if it hasn't yet been initialized.
 func (e *ETCD) initS3IfNil(ctx context.Context) error {
 	if e.s3 == nil {
-		s3, err := newS3(ctx, e.config)
+		s3, err := NewS3(ctx, e.config)
 		if err != nil {
 			return err
 		}
@@ -970,40 +1334,43 @@ func (e *ETCD) initS3IfNil(ctx context.Context) error {
 	return nil
 }
 
-// PruneSnapshots perfrorms a retention run with the given
+// PruneSnapshots performs a retention run with the given
 // retention duration and removes expired snapshots.
 func (e *ETCD) PruneSnapshots(ctx context.Context) error {
-	snapshotDir, err := snapshotDir(e.config)
+	snapshotDir, err := snapshotDir(e.config, false)
 	if err != nil {
 		return errors.Wrap(err, "failed to get the snapshot dir")
 	}
-
-	if e.config.EtcdS3 {
-		if e.initS3IfNil(ctx); err != nil {
-			return err
-		}
-
-		return e.s3.snapshotRetention(ctx)
+	if err := snapshotRetention(e.config.EtcdSnapshotRetention, e.config.EtcdSnapshotName, snapshotDir); err != nil {
+		logrus.Errorf("Error applying snapshot retention policy: %v", err)
 	}
 
-	return snapshotRetention(e.config.EtcdSnapshotRetention, snapshotDir)
+	if e.config.EtcdS3 {
+		if err := e.initS3IfNil(ctx); err != nil {
+			logrus.Warnf("Unable to initialize S3 client during prune: %v", err)
+		} else {
+			if err := e.s3.snapshotRetention(ctx); err != nil {
+				logrus.Errorf("Error applying S3 snapshot retention policy: %v", err)
+			}
+		}
+	}
+
+	return e.ReconcileSnapshotData(ctx)
 }
 
 // ListSnapshots is an exported wrapper method that wraps an
 // unexported method of the same name.
-func (e *ETCD) ListSnapshots(ctx context.Context) ([]SnapshotFile, error) {
-	snapshotDir, err := snapshotDir(e.config)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get the snapshot dir")
+func (e *ETCD) ListSnapshots(ctx context.Context) (map[string]snapshotFile, error) {
+	if e.config.EtcdS3 {
+		return e.listS3Snapshots(ctx)
 	}
-
-	return e.listSnapshots(ctx, snapshotDir)
+	return e.listLocalSnapshots()
 }
 
 // deleteSnapshots removes the given snapshots from
 // either local storage or S3.
 func (e *ETCD) DeleteSnapshots(ctx context.Context, snapshots []string) error {
-	snapshotDir, err := snapshotDir(e.config)
+	snapshotDir, err := snapshotDir(e.config, false)
 	if err != nil {
 		return errors.Wrap(err, "failed to get the snapshot dir")
 	}
@@ -1018,7 +1385,7 @@ func (e *ETCD) DeleteSnapshots(ctx context.Context, snapshots []string) error {
 
 		objectsCh := make(chan minio.ObjectInfo)
 
-		ctx, cancel := context.WithTimeout(ctx, defaultS3OpTimeout)
+		ctx, cancel := context.WithTimeout(ctx, e.config.EtcdS3Timeout)
 		defer cancel()
 
 		go func() {
@@ -1049,7 +1416,7 @@ func (e *ETCD) DeleteSnapshots(ctx context.Context, snapshots []string) error {
 			select {
 			case <-ctx.Done():
 				logrus.Errorf("Unable to delete snapshot: %v", ctx.Err())
-				return e.StoreSnapshotData(ctx)
+				return e.ReconcileSnapshotData(ctx)
 			case <-time.After(time.Millisecond * 100):
 				continue
 			case err, ok := <-e.s3.client.RemoveObjects(ctx, e.config.EtcdS3BucketName, objectsCh, minio.RemoveObjectsOptions{}):
@@ -1057,80 +1424,56 @@ func (e *ETCD) DeleteSnapshots(ctx context.Context, snapshots []string) error {
 					logrus.Errorf("Unable to delete snapshot: %v", err.Err)
 				}
 				if !ok {
-					return e.StoreSnapshotData(ctx)
+					return e.ReconcileSnapshotData(ctx)
 				}
 			}
 		}
 	}
 
 	logrus.Info("Removing the given locally stored etcd snapshot(s)")
-	logrus.Debugf("Removing the given locally stored etcd snapshot(s): %v", snapshots)
+	logrus.Debugf("Attempting to remove the given locally stored etcd snapshot(s): %v", snapshots)
 
 	for _, s := range snapshots {
 		// check if the given snapshot exists. If it does,
 		// remove it, otherwise continue.
 		sf := filepath.Join(snapshotDir, s)
 		if _, err := os.Stat(sf); os.IsNotExist(err) {
+			logrus.Infof("Snapshot %s, does not exist", s)
 			continue
 		}
 		if err := os.Remove(sf); err != nil {
 			return err
 		}
+		logrus.Debug("Removed snapshot ", s)
 	}
 
-	return e.StoreSnapshotData(ctx)
+	return e.ReconcileSnapshotData(ctx)
 }
 
-// updateSnapshotData populates the given map with the contents of the given slice.
-func updateSnapshotData(data map[string]string, snapshotFiles []SnapshotFile) error {
-	for _, v := range snapshotFiles {
-		b, err := json.Marshal(v)
-		if err != nil {
-			return err
-		}
-		data[v.Name] = string(b)
-	}
-
-	return nil
-}
-
-// StoreSnapshotData stores the given snapshot data in the "snapshots" ConfigMap.
-func (e *ETCD) StoreSnapshotData(ctx context.Context) error {
-	logrus.Infof("Saving current etcd snapshot set to %s ConfigMap", snapshotConfigMapName)
-
-	snapshotDir, err := snapshotDir(e.config)
-	if err != nil {
-		return errors.Wrap(err, "failed to get the snapshot dir")
-	}
-
+// AddSnapshotData adds the given snapshot file information to the snapshot configmap, using the existing extra metadata
+// available at the time.
+func (e *ETCD) addSnapshotData(sf snapshotFile) error {
 	return retry.OnError(retry.DefaultBackoff, func(err error) bool {
 		return apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err)
 	}, func() error {
-		// make sure the core.Factory is initialize. There can
+		// make sure the core.Factory is initialized. There can
 		// be a race between this core code startup.
 		for e.config.Runtime.Core == nil {
 			runtime.Gosched()
 		}
-
 		snapshotConfigMap, getErr := e.config.Runtime.Core.Core().V1().ConfigMap().Get(metav1.NamespaceSystem, snapshotConfigMapName, metav1.GetOptions{})
 
-		snapshotFiles, err := e.listSnapshots(ctx, snapshotDir)
+		marshalledSnapshotFile, err := json.Marshal(sf)
 		if err != nil {
 			return err
 		}
-
-		data := make(map[string]string, len(snapshotFiles))
-		if err := updateSnapshotData(data, snapshotFiles); err != nil {
-			return err
-		}
-
 		if apierrors.IsNotFound(getErr) {
 			cm := v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      snapshotConfigMapName,
 					Namespace: metav1.NamespaceSystem,
 				},
-				Data: data,
+				Data: map[string]string{sf.Name: string(marshalledSnapshotFile)},
 			}
 			_, err := e.config.Runtime.Core.Core().V1().ConfigMap().Create(&cm)
 			return err
@@ -1140,24 +1483,179 @@ func (e *ETCD) StoreSnapshotData(ctx context.Context) error {
 			snapshotConfigMap.Data = make(map[string]string)
 		}
 
+		sfKey := generateSnapshotConfigMapKey(sf)
+		snapshotConfigMap.Data[sfKey] = string(marshalledSnapshotFile)
+
+		_, err = e.config.Runtime.Core.Core().V1().ConfigMap().Update(snapshotConfigMap)
+		return err
+	})
+}
+
+func generateSnapshotConfigMapKey(sf snapshotFile) string {
+	var sfKey string
+	if sf.NodeName == "s3" {
+		sfKey = "s3-" + sf.Name
+	} else {
+		sfKey = "local-" + sf.Name
+	}
+	return sfKey
+}
+
+// ReconcileSnapshotData reconciles snapshot data in the snapshot ConfigMap.
+// It will reconcile snapshot data from disk locally always, and if S3 is enabled, will attempt to list S3 snapshots
+// and reconcile snapshots from S3. Notably,
+func (e *ETCD) ReconcileSnapshotData(ctx context.Context) error {
+	logrus.Infof("Reconciling etcd snapshot data in %s ConfigMap", snapshotConfigMapName)
+	defer logrus.Infof("Reconciliation of snapshot data in %s ConfigMap complete", snapshotConfigMapName)
+	return retry.OnError(retry.DefaultBackoff, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsAlreadyExists(err)
+	}, func() error {
+		// make sure the core.Factory is initialize. There can
+		// be a race between this core code startup.
+		for e.config.Runtime.Core == nil {
+			runtime.Gosched()
+		}
+
+		logrus.Debug("core.Factory is initialized")
+
+		snapshotConfigMap, getErr := e.config.Runtime.Core.Core().V1().ConfigMap().Get(metav1.NamespaceSystem, snapshotConfigMapName, metav1.GetOptions{})
+		if apierrors.IsNotFound(getErr) {
+			// Can't reconcile what doesn't exist.
+			return errors.New("No snapshot configmap found")
+		}
+
+		logrus.Debugf("Attempting to reconcile etcd snapshot data for configmap generation %d", snapshotConfigMap.Generation)
+
+		// if the snapshot config map data is nil, no need to reconcile.
+		if snapshotConfigMap.Data == nil {
+			return nil
+		}
+
+		snapshotFiles, err := e.listLocalSnapshots()
+		if err != nil {
+			return err
+		}
+
+		// s3ListSuccessful is set to true if we are successful at listing snapshots from S3 to eliminate accidental
+		// clobbering of S3 snapshots in the configmap due to misconfigured S3 credentials/details
+		s3ListSuccessful := false
+
+		if e.config.EtcdS3 {
+			if s3Snapshots, err := e.listS3Snapshots(ctx); err != nil {
+				logrus.Errorf("error retrieving S3 snapshots for reconciliation: %v", err)
+			} else {
+				for k, v := range s3Snapshots {
+					snapshotFiles[k] = v
+				}
+				s3ListSuccessful = true
+			}
+		}
+
 		nodeName := os.Getenv("NODE_NAME")
 
-		// remove entries for this node only
+		// deletedSnapshots is a map[string]string where key is the configmap key and the value is the marshalled snapshot file
+		// it will be populated below with snapshots that are either from S3 or on the local node. Notably, deletedSnapshots will
+		// not contain snapshots that are in the "failed" status
+		deletedSnapshots := make(map[string]string)
+		// failedSnapshots is a slice of unmarshaled snapshot files sourced from the configmap
+		// These are stored unmarshaled so we can sort based on name.
+		var failedSnapshots []snapshotFile
+		var failedS3Snapshots []snapshotFile
+
+		// remove entries for this node and s3 (if S3 is enabled) only
 		for k, v := range snapshotConfigMap.Data {
-			var sf SnapshotFile
+			var sf snapshotFile
 			if err := json.Unmarshal([]byte(v), &sf); err != nil {
 				return err
 			}
-			if sf.NodeName == nodeName || sf.NodeName == "s3" {
+			if (sf.NodeName == nodeName || (sf.NodeName == "s3" && s3ListSuccessful)) && sf.Status != failedSnapshotStatus {
+				// Only delete the snapshot if the snapshot was not failed
+				// sf.Status != FailedSnapshotStatus is intentional, as it is possible we are reconciling snapshots stored from older versions that did not set status
+				deletedSnapshots[generateSnapshotConfigMapKey(sf)] = v // store a copy of the snapshot
+				delete(snapshotConfigMap.Data, k)
+			} else if sf.Status == failedSnapshotStatus && sf.NodeName == nodeName && e.config.EtcdSnapshotRetention >= 1 {
+				// Handle locally failed snapshots.
+				failedSnapshots = append(failedSnapshots, sf)
+				delete(snapshotConfigMap.Data, k)
+			} else if sf.Status == failedSnapshotStatus && e.config.EtcdS3 && sf.NodeName == "s3" && strings.HasPrefix(sf.Name, e.config.EtcdSnapshotName+"-"+nodeName) && e.config.EtcdSnapshotRetention >= 1 {
+				// If we're operating against S3, we can clean up failed S3 snapshots that failed on this node.
+				failedS3Snapshots = append(failedS3Snapshots, sf)
 				delete(snapshotConfigMap.Data, k)
 			}
 		}
 
-		// save this node's entries to the ConfigMap
-		for k, v := range data {
-			snapshotConfigMap.Data[k] = v
+		// Apply the failed snapshot retention policy to locally failed snapshots
+		if len(failedSnapshots) > 0 && e.config.EtcdSnapshotRetention >= 1 {
+			sort.Slice(failedSnapshots, func(i, j int) bool {
+				return failedSnapshots[i].Name > failedSnapshots[j].Name
+			})
+
+			var keepCount int
+			if e.config.EtcdSnapshotRetention >= len(failedSnapshots) {
+				keepCount = len(failedSnapshots)
+			} else {
+				keepCount = e.config.EtcdSnapshotRetention
+			}
+			for _, dfs := range failedSnapshots[:keepCount] {
+				sfKey := generateSnapshotConfigMapKey(dfs)
+				marshalledSnapshot, err := json.Marshal(dfs)
+				if err != nil {
+					logrus.Errorf("unable to marshal snapshot to store in configmap %v", err)
+				} else {
+					snapshotConfigMap.Data[sfKey] = string(marshalledSnapshot)
+				}
+			}
 		}
 
+		// Apply the failed snapshot retention policy to the S3 snapshots
+		if len(failedS3Snapshots) > 0 && e.config.EtcdSnapshotRetention >= 1 {
+			sort.Slice(failedS3Snapshots, func(i, j int) bool {
+				return failedS3Snapshots[i].Name > failedS3Snapshots[j].Name
+			})
+
+			var keepCount int
+			if e.config.EtcdSnapshotRetention >= len(failedS3Snapshots) {
+				keepCount = len(failedS3Snapshots)
+			} else {
+				keepCount = e.config.EtcdSnapshotRetention
+			}
+			for _, dfs := range failedS3Snapshots[:keepCount] {
+				sfKey := generateSnapshotConfigMapKey(dfs)
+				marshalledSnapshot, err := json.Marshal(dfs)
+				if err != nil {
+					logrus.Errorf("unable to marshal snapshot to store in configmap %v", err)
+				} else {
+					snapshotConfigMap.Data[sfKey] = string(marshalledSnapshot)
+				}
+			}
+		}
+
+		// save the local entries to the ConfigMap if they are still on disk or in S3.
+		for _, snapshot := range snapshotFiles {
+			var sf snapshotFile
+			sfKey := generateSnapshotConfigMapKey(snapshot)
+			if v, ok := deletedSnapshots[sfKey]; ok {
+				// use the snapshot file we have from the existing configmap, and unmarshal it so we can manipulate it
+				if err := json.Unmarshal([]byte(v), &sf); err != nil {
+					logrus.Errorf("error unmarshaling snapshot file: %v", err)
+					// use the snapshot with info we sourced from disk/S3 (will be missing metadata, but something is better than nothing)
+					sf = snapshot
+				}
+			} else {
+				sf = snapshot
+			}
+
+			sf.Status = successfulSnapshotStatus // if the snapshot is on disk or in S3, it was successful.
+
+			marshalledSnapshot, err := json.Marshal(sf)
+			if err != nil {
+				logrus.Warnf("unable to marshal snapshot metadata %s to store in configmap, received error: %v", sf.Name, err)
+			} else {
+				snapshotConfigMap.Data[sfKey] = string(marshalledSnapshot)
+			}
+		}
+
+		logrus.Debugf("Updating snapshot ConfigMap (%s) with %d entries", snapshotConfigMapName, len(snapshotConfigMap.Data))
 		_, err = e.config.Runtime.Core.Core().V1().ConfigMap().Update(snapshotConfigMap)
 		return err
 	})
@@ -1177,7 +1675,7 @@ func (e *ETCD) setSnapshotFunction(ctx context.Context) {
 // completion.
 func (e *ETCD) Restore(ctx context.Context) error {
 	// check the old etcd data dir
-	oldDataDir := etcdDBDir(e.config) + "-old-" + strconv.Itoa(int(time.Now().Unix()))
+	oldDataDir := DBDir(e.config) + "-old-" + strconv.Itoa(int(time.Now().Unix()))
 	if e.config.ClusterResetRestorePath == "" {
 		return errors.New("no etcd restore path was specified")
 	}
@@ -1185,36 +1683,57 @@ func (e *ETCD) Restore(ctx context.Context) error {
 	if _, err := os.Stat(e.config.ClusterResetRestorePath); err != nil {
 		return err
 	}
+
+	var restorePath string
+	if strings.HasSuffix(e.config.ClusterResetRestorePath, compressedExtension) {
+		snapshotDir, err := snapshotDir(e.config, true)
+		if err != nil {
+			return errors.Wrap(err, "failed to get the snapshot dir")
+		}
+
+		decompressSnapshot, err := e.decompressSnapshot(snapshotDir, e.config.ClusterResetRestorePath)
+		if err != nil {
+			return err
+		}
+
+		restorePath = decompressSnapshot
+	} else {
+		restorePath = e.config.ClusterResetRestorePath
+	}
+
 	// move the data directory to a temp path
-	if err := os.Rename(etcdDBDir(e.config), oldDataDir); err != nil {
+	if err := os.Rename(DBDir(e.config), oldDataDir); err != nil {
 		return err
 	}
+
 	logrus.Infof("Pre-restore etcd database moved to %s", oldDataDir)
-	sManager := snapshot.NewV3(nil)
-	if err := sManager.Restore(snapshot.RestoreConfig{
-		SnapshotPath:   e.config.ClusterResetRestorePath,
+
+	return snapshot.NewV3(nil).Restore(snapshot.RestoreConfig{
+		SnapshotPath:   restorePath,
 		Name:           e.name,
-		OutputDataDir:  etcdDBDir(e.config),
+		OutputDataDir:  DBDir(e.config),
 		OutputWALDir:   walDir(e.config),
 		PeerURLs:       []string{e.peerURL()},
 		InitialCluster: e.name + "=" + e.peerURL(),
-	}); err != nil {
-		return err
-	}
-	return nil
+	})
 }
 
 // snapshotRetention iterates through the snapshots and removes the oldest
 // leaving the desired number of snapshots.
-func snapshotRetention(retention int, snapshotDir string) error {
+func snapshotRetention(retention int, snapshotPrefix string, snapshotDir string) error {
+	if retention < 1 {
+		return nil
+	}
+
 	nodeName := os.Getenv("NODE_NAME")
+	logrus.Infof("Applying local snapshot retention policy: retention: %d, snapshotPrefix: %s, directory: %s", retention, snapshotPrefix+"-"+nodeName, snapshotDir)
 
 	var snapshotFiles []os.FileInfo
 	if err := filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if strings.HasPrefix(info.Name(), snapshotPrefix+nodeName) {
+		if strings.HasPrefix(info.Name(), snapshotPrefix+"-"+nodeName) {
 			snapshotFiles = append(snapshotFiles, info)
 		}
 		return nil
@@ -1230,7 +1749,9 @@ func snapshotRetention(retention int, snapshotDir string) error {
 
 	delCount := len(snapshotFiles) - retention
 	for _, df := range snapshotFiles[:delCount] {
-		if err := os.Remove(filepath.Join(snapshotDir, df.Name())); err != nil {
+		snapshotPath := filepath.Join(snapshotDir, df.Name())
+		logrus.Infof("Removing local snapshot %s", snapshotPath)
+		if err := os.Remove(snapshotPath); err != nil {
 			return err
 		}
 	}
@@ -1273,9 +1794,6 @@ func backupDirWithRetention(dir string, maxBackupRetention int) (string, error) 
 // GetAPIServerURLFromETCD will try to fetch the version.Program/apiaddresses key from etcd
 // when it succeed it will parse the first address in the list and return back an address
 func GetAPIServerURLFromETCD(ctx context.Context, cfg *config.Control) (string, error) {
-	if cfg.Runtime == nil {
-		return "", fmt.Errorf("runtime is not ready yet")
-	}
 	cl, err := GetClient(ctx, cfg.Runtime, endpoint)
 	if err != nil {
 		return "", err
@@ -1316,15 +1834,33 @@ func (e *ETCD) GetMembersClientURLs(ctx context.Context) ([]string, error) {
 	return memberUrls, nil
 }
 
+// GetMembersNames will list through the member lists in etcd and return
+// back a combined list of member names
+func (e *ETCD) GetMembersNames(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, testTimeout)
+	defer cancel()
+
+	members, err := e.client.MemberList(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var memberNames []string
+	for _, member := range members.Members {
+		memberNames = append(memberNames, member.Name)
+	}
+	return memberNames, nil
+}
+
 // RemoveSelf will remove the member if it exists in the cluster
 func (e *ETCD) RemoveSelf(ctx context.Context) error {
-	if err := e.removePeer(ctx, e.name, e.address, true); err != nil {
+	if err := e.RemovePeer(ctx, e.name, e.address, true); err != nil {
 		return err
 	}
 
 	// backup the data dir to avoid issues when re-enabling etcd
-	oldDataDir := etcdDBDir(e.config) + "-old-" + strconv.Itoa(int(time.Now().Unix()))
+	oldDataDir := DBDir(e.config) + "-old-" + strconv.Itoa(int(time.Now().Unix()))
 
 	// move the data directory to a temp path
-	return os.Rename(etcdDBDir(e.config), oldDataDir)
+	return os.Rename(DBDir(e.config), oldDataDir)
 }
